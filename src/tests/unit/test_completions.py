@@ -539,6 +539,35 @@ async def test_stream_completion_success(
     assert routed_token_types == {"prompt", "completion"}
 
 
+async def test_stream_completion_reads_openai_shaped_chunks(
+    httpx_mock: HTTPXMock, mock_request, metrics_spy
+):
+    """An OpenAI-shaped stream sends "usage": null on content chunks and "choices": [] with usage."""
+    mock_chunks = [
+        b'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}], "usage": null}\n\n',
+        b'data: {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 25}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    httpx_mock.add_response(
+        method="POST",
+        url=LITELLM_COMPLETIONS_URL,
+        stream=IteratorStream(mock_chunks),
+        status_code=200,
+    )
+
+    received_chunks = [
+        chunk async for chunk in stream_completion(mock_request, SAMPLE_REQUEST)
+    ]
+
+    assert received_chunks == mock_chunks
+    chat_label_base = {
+        "model": SAMPLE_REQUEST.model,
+        "service_type": SAMPLE_REQUEST.service_type,
+        "purpose": SAMPLE_REQUEST.purpose,
+    }
+    assert metrics_spy.value("chat_tokens", type="completion", **chat_label_base) == 25
+
+
 async def test_stream_completion_litellm_routing_with_fallback(
     httpx_mock: HTTPXMock, mock_request, metrics_spy
 ):

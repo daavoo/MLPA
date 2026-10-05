@@ -15,12 +15,14 @@ from mlpa.core.classes import AssertionAuth, AttestationAuth
 from mlpa.core.config import (
     ERROR_CODE_MAX_USERS_REACHED,
     LITELLM_MASTER_AUTH_HEADERS,
+    USE_OTARI,
     env,
 )
 from mlpa.core.consts.country_codes import COUNTRY_CODES
 from mlpa.core.http_client import get_http_client
 from mlpa.core.logger import logger
 from mlpa.core.prometheus_metrics import PrometheusResult, metrics
+from mlpa.core.services.otari_service import OtariService
 from mlpa.core.services.services import app_attest_pg, litellm_pg
 
 KNOWN_HTTP_METHODS = frozenset(
@@ -142,6 +144,8 @@ async def get_or_create_user(user_id: str):
 
     client = get_http_client()
     claimed_new_identity = False
+    if USE_OTARI:
+        return await _get_or_admit_otari_user(user_id, base_identity, service_type)
     try:
         db_user = await litellm_pg.get_user(user_id)
 
@@ -202,6 +206,38 @@ async def get_or_create_user(user_id: str):
         raise HTTPException(
             status_code=500, detail={"error": f"Error fetching user info"}
         )
+
+
+async def _get_or_admit_otari_user(
+    user_id: str, base_identity: str, service_type: str
+) -> list:
+    """The Otari end user for ``user_id``, admitting a new one under the signup cap.
+
+    Otari creates an end user on its first request, so a new user is only
+    admitted here. Blocking is enforced by Otari on the request itself.
+    """
+    otari = cast(OtariService, litellm_pg)
+    if otari.is_known(user_id):
+        return [{"user_id": user_id, "blocked": False}, False]
+    try:
+        user = await otari.get_user(user_id)
+    except Exception as e:
+        logger.error(f"Error fetching Otari user {user_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail={"error": "Error fetching user info"}
+        )
+    if user is not None:
+        return [user, False]
+    if env.MLPA_ENFORCE_SIGNIN_CAP and service_type in env.MLPA_CAPPED_SERVICE_TYPES:
+        admitted, _newly_claimed = await app_attest_pg.admit_managed_base_identity(
+            base_identity=base_identity
+        )
+        if not admitted:
+            raise HTTPException(
+                status_code=403, detail={"error": ERROR_CODE_MAX_USERS_REACHED}
+            )
+    otari.remember(user_id)
+    return [{"user_id": user_id, "blocked": False}, True]
 
 
 def b64decode_safe(data_b64: str, obj_name: str = "object") -> bytes:

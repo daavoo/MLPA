@@ -3,11 +3,12 @@ from fastapi import HTTPException
 from mlpa.core.config import env
 from mlpa.core.logger import logger
 from mlpa.core.services.litellm_pg_service import LiteLLMPGService
+from mlpa.core.services.otari_service import OtariService
 from mlpa.core.services.pg_service import PGService
 
 
 class AppAttestPGService(PGService):
-    def __init__(self, litellm_pg: LiteLLMPGService):
+    def __init__(self, litellm_pg: LiteLLMPGService | OtariService):
         super().__init__(env.APP_ATTEST_DB_NAME)
         self.litellm_pg = litellm_pg
 

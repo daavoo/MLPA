@@ -11,10 +11,15 @@ from mlpa.core.classes import AuthorizedChatRequest, AuthorizedSearchRequest
 from mlpa.core.config import (
     ERROR_CODE_MAX_USERS_REACHED,
     LITELLM_COMPLETIONS_URL,
+    USE_OTARI,
     env,
     resolve_litellm_virtual_auth_headers,
 )
-from mlpa.core.errors import classify_upstream_error
+from mlpa.core.errors import (
+    USER_BLOCKED_DETAIL,
+    classify_upstream_error,
+    is_otari_user_blocked,
+)
 from mlpa.core.http_client import get_http_client
 from mlpa.core.litellm_routing import parse_litellm_routing_headers
 from mlpa.core.logger import logger
@@ -59,12 +64,16 @@ def _build_litellm_body(req: AuthorizedChatRequest, *, stream: bool) -> dict:
     # tags would be litellm-native but spend-by-tag reporting is Enterprise-only
     # and tags are flat strings, harder to query in BQ. JSON metadata is OSS and
     # queryable as a plain key.
-    body["metadata"] = {
-        "spend_logs_metadata": {
-            "purpose": req.purpose,
-            "country_code": req.client_country,
+    if USE_OTARI:
+        # Otari has no spend metadata yet and serves no mock model; it would drop both.
+        body.pop("mock_response", None)
+    else:
+        body["metadata"] = {
+            "spend_logs_metadata": {
+                "purpose": req.purpose,
+                "country_code": req.client_country,
+            }
         }
-    }
     return sanitize_request_body(body)
 
 
@@ -120,7 +129,8 @@ async def stream_completion(
     start_time = time.perf_counter()
     record_request_with_tools(authorized_chat_request)
     auth_headers = resolve_litellm_virtual_auth_headers(
-        authorized_chat_request.litellm_virtual_key
+        authorized_chat_request.litellm_virtual_key,
+        authorized_chat_request.service_type,
     )
     body = _build_litellm_body(authorized_chat_request, stream=True)
     result = PrometheusResult.ERROR
@@ -179,10 +189,14 @@ async def stream_completion(
                     except Exception:
                         pass
 
+                    if is_otari_user_blocked(e.response.headers):
+                        yield f"data: {json.dumps(USER_BLOCKED_DETAIL)}\n\n".encode()
+                        return
                     match = classify_upstream_error(
                         error_text=error_text_str,
                         status_code=e.response.status_code,
                         user=authorized_chat_request.user,
+                        headers=e.response.headers,
                     )
                     if match is not None:
                         if match.log_message:
@@ -255,7 +269,9 @@ async def stream_completion(
                         for line in chunk_str.split("\n"):
                             if line.startswith("data: ") and line != "data: [DONE]":
                                 data = json.loads(line[6:])
-                                if "usage" in data:
+                                # OpenAI-shaped streams (Otari's among them) send
+                                # "usage": null on every chunk but the last.
+                                if data.get("usage"):
                                     usage = data["usage"]
                                     prompt_tokens = usage.get("prompt_tokens", 0)
                                     completion_tokens = usage.get(
@@ -269,17 +285,17 @@ async def stream_completion(
                                         log.warning(
                                             f"Missing 'completion_tokens' in usage for model {authorized_chat_request.model}"
                                         )
-                                for tc in (
-                                    data.get("choices", [{}])[0]
-                                    .get("delta", {})
-                                    .get("tool_calls", [])
-                                ):
+                                # The usage chunk carries "choices": [].
+                                choices = data.get("choices") or [{}]
+                                for tc in (choices[0].get("delta") or {}).get(
+                                    "tool_calls"
+                                ) or []:
                                     idx = tc.get("index", len(tool_calls_accum))
                                     if idx not in tool_calls_accum:
                                         tool_calls_accum[idx] = {
                                             "function": {"name": ""}
                                         }
-                                    name = tc.get("function", {}).get("name")
+                                    name = (tc.get("function") or {}).get("name")
                                     if name:
                                         tool_calls_accum[idx]["function"]["name"] = (
                                             tool_calls_accum[idx]["function"]["name"]
@@ -395,17 +411,21 @@ async def _get_completion(
             response = await client.post(
                 LITELLM_COMPLETIONS_URL,
                 headers=resolve_litellm_virtual_auth_headers(
-                    authorized_chat_request.litellm_virtual_key
+                    authorized_chat_request.litellm_virtual_key,
+                    authorized_chat_request.service_type,
                 ),
                 json=body,
             )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if is_otari_user_blocked(e.response.headers):
+                raise HTTPException(status_code=403, detail=USER_BLOCKED_DETAIL)
             match = classify_upstream_error(
                 error_text=e.response.text,
                 status_code=e.response.status_code,
                 user=authorized_chat_request.user,
+                headers=e.response.headers,
             )
             if match is not None:
                 if match.log_message:

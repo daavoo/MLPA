@@ -1,4 +1,5 @@
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from mlpa.core.config import (
@@ -9,6 +10,8 @@ from mlpa.core.config import (
     ERROR_CODE_RATE_LIMIT_EXCEEDED,
     ERROR_CODE_REQUEST_TOO_LARGE,
     ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED,
+    OTARI_HEADER_BUDGET_SCOPE,
+    OTARI_HEADER_ERROR_CODE,
 )
 from mlpa.core.prometheus_metrics import AvailabilityReason, PrometheusRejectionReason
 from mlpa.core.utils import (
@@ -98,12 +101,69 @@ def _parse_rate_limit_error(error_text: str) -> int | None:
     return None
 
 
+def _rejection(
+    error_code: int, user: str, error_text: str, retry_after: str | None = None
+) -> RejectionMatch:
+    http_status, reason, default_retry_after, log_prefix = _RATE_LIMIT_REJECTION[
+        error_code
+    ]
+    return RejectionMatch(
+        reason=reason,
+        error_code=error_code,
+        http_status=http_status,
+        retry_after=retry_after or default_retry_after,
+        log_message=f"{log_prefix} for user {user}: {error_text}",
+    )
+
+
+def _classify_otari_error(
+    *, error_code: str, headers: Mapping[str, str], error_text: str, user: str
+) -> RejectionMatch | None:
+    """Map Otari's stable Otari-Error-Code to MLPA's error codes; no text matching."""
+    if error_code == "budget_exceeded":
+        # The end user's own budget is MLPA's per-user budget; any other scope
+        # (the service key's ceiling, the workspace) is the global one.
+        if headers.get(OTARI_HEADER_BUDGET_SCOPE) == "user":
+            return _rejection(ERROR_CODE_BUDGET_LIMIT_EXCEEDED, user, error_text)
+        return _rejection(ERROR_CODE_GLOBAL_BUDGET_LIMIT_EXCEEDED, user, error_text)
+    if error_code == "rate_limited":
+        return _rejection(
+            ERROR_CODE_RATE_LIMIT_EXCEEDED, user, error_text, headers.get("retry-after")
+        )
+    if error_code == "upstream_rate_limited":
+        return _rejection(
+            ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED,
+            user,
+            error_text,
+            headers.get("retry-after"),
+        )
+    if error_code in {"invalid_model", "model_not_allowed"}:
+        return RejectionMatch(
+            reason=PrometheusRejectionReason.INVALID_MODEL_NAME,
+            error_code=ERROR_CODE_INVALID_MODEL_NAME,
+            http_status=400,
+            log_message=f"Invalid model name for user {user}: {error_text}",
+        )
+    return None
+
+
 def classify_upstream_error(
     *,
     error_text: str,
     status_code: int,
     user: str,
+    headers: Mapping[str, str] | None = None,
 ) -> RejectionMatch | None:
+    otari_error_code = (headers or {}).get(OTARI_HEADER_ERROR_CODE)
+    if otari_error_code:
+        match = _classify_otari_error(
+            error_code=otari_error_code,
+            headers=headers or {},
+            error_text=error_text,
+            user=user,
+        )
+        if match is not None:
+            return match
     if status_code in {400, 429}:
         error_code = _parse_rate_limit_error(error_text)
         if error_code is not None and error_code in _RATE_LIMIT_REJECTION:
@@ -140,3 +200,15 @@ def classify_upstream_error(
                 log_message=f"Invalid request for user {user}: {error_text}",
             )
     return None
+
+
+USER_BLOCKED_DETAIL = {"error": "User is blocked."}
+
+
+def is_otari_user_blocked(headers: Mapping[str, str] | None) -> bool:
+    """Whether Otari refused because the end user is blocked.
+
+    MLPA checks a LiteLLM user's blocked flag before the call; with Otari that
+    check rides on the call itself, so the refusal is answered the same way here.
+    """
+    return (headers or {}).get(OTARI_HEADER_ERROR_CODE) == "user_blocked"
