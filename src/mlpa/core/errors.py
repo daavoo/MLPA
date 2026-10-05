@@ -1,6 +1,7 @@
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from mlpa.core.config import (
     ERROR_CODE_BUDGET_LIMIT_EXCEEDED,
@@ -116,6 +117,30 @@ def _rejection(
     )
 
 
+def otari_code(headers: Mapping[str, str] | None, error_text: str = "") -> str | None:
+    """Otari's refusal code, from the Otari-Error-Code header or the body's "code"."""
+    code = (headers or {}).get(OTARI_HEADER_ERROR_CODE)
+    if code:
+        return code
+    try:
+        body = json.loads(error_text) if error_text else None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def classify_otari_stream_error(event: Any, user: str) -> RejectionMatch | None:
+    """A coded Otari stream error event (``{"error": {"code": ...}}``) as MLPA's rejection, or None."""
+    error = event.get("error") if isinstance(event, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if not isinstance(code, str):
+        return None
+    return _classify_otari_error(
+        error_code=code, headers={}, error_text=json.dumps(event), user=user
+    )
+
+
 def _classify_otari_error(
     *, error_code: str, headers: Mapping[str, str], error_text: str, user: str
 ) -> RejectionMatch | None:
@@ -137,6 +162,13 @@ def _classify_otari_error(
             error_text,
             headers.get("retry-after"),
         )
+    if error_code == "context_length_exceeded":
+        return RejectionMatch(
+            reason=PrometheusRejectionReason.PAYLOAD_TOO_LARGE,
+            error_code=ERROR_CODE_REQUEST_TOO_LARGE,
+            http_status=413,
+            log_message=f"Context window exceeded for user {user}: {error_text}",
+        )
     if error_code in {"invalid_model", "model_not_allowed"}:
         return RejectionMatch(
             reason=PrometheusRejectionReason.INVALID_MODEL_NAME,
@@ -154,7 +186,7 @@ def classify_upstream_error(
     user: str,
     headers: Mapping[str, str] | None = None,
 ) -> RejectionMatch | None:
-    otari_error_code = (headers or {}).get(OTARI_HEADER_ERROR_CODE)
+    otari_error_code = otari_code(headers, error_text)
     if otari_error_code:
         match = _classify_otari_error(
             error_code=otari_error_code,
@@ -211,4 +243,4 @@ def is_otari_user_blocked(headers: Mapping[str, str] | None) -> bool:
     MLPA checks a LiteLLM user's blocked flag before the call; with Otari that
     check rides on the call itself, so the refusal is answered the same way here.
     """
-    return (headers or {}).get(OTARI_HEADER_ERROR_CODE) == "user_blocked"
+    return otari_code(headers) == "user_blocked"

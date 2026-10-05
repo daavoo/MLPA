@@ -1,8 +1,8 @@
 """
 Provision MLPA in Otari, the counterpart of create-and-set-virtual-key.py.
 
-Creates, for each service type, the budget, the owner user and the service key,
-and the per-user rate limit rule, then writes the keys' secrets to .env as
+Creates or updates, for each service type, the budget (with its per-user RPM
+and TPM), the owner user and the service key, then writes the keys' secrets to the env file as
 OTARI_SERVICE_KEYS. A key's secret is only shown when it is created, so a key
 that already exists is rotated only with --rotate.
 
@@ -35,7 +35,7 @@ async def main(rotate: bool, env_file: str) -> None:
     service = OtariService()
     await service.connect()
     try:
-        secrets = await service.provision_keys(rotate=rotate)
+        secrets = await service.provision(rotate=rotate)
     finally:
         await service.disconnect()
     keys = {**env.OTARI_SERVICE_KEYS, **secrets}

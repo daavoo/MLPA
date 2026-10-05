@@ -17,14 +17,17 @@ How MLPA's model maps onto Otari:
   key. The `user` MLPA sends (`<identity>:<service type>`) names an end user of that owner, and Otari
   creates it on first use with the key's end-user budget. `/customer/new` and the direct SQL into
   LiteLLM's tables are gone: `OtariService` answers the same calls through Otari's users API.
-- **Budgets and limits.** Each service type's budget is an Otari budget named after its `budget_id`.
-  Its per-user RPM and TPM are a `rate_limits` rule, `per: user`, narrowed to that service type's key,
-  with `tpm_admission: used`, so a request is limited by the tokens it used, as LiteLLM does.
-  `create_budget()` at startup brings budgets, key budgets and rules in line with the config.
+- **Budgets and limits.** Each service type's budget is an Otari budget named after its `budget_id`,
+  carrying the dollar cap and period plus the per-user `rpm_limit` and `tpm_limit` (tokens counted on
+  what requests used, as LiteLLM counts them). Moving a user to another budget moves all of it.
+- **Provisioning.** `scripts/otari_provision.py` is the only writer, run as a deploy step. MLPA
+  replicas only read at startup, to learn the budgets' Otari ids and log anything missing: replicas
+  that each upserted would race into duplicate budgets and overwrite changes made in Otari.
 - **Errors.** Errors are mapped from Otari's `Otari-Error-Code` header, not from message text.
-  `budget_exceeded` maps to 1, or to 10 when `Otari-Budget-Scope` is not `user`. `rate_limited` maps
-  to 2, `upstream_rate_limited` to 5, `invalid_model` to 8, and `user_blocked` to
-  403 `User is blocked.`.
+  The code comes from the header or the body's `code`. `budget_exceeded` maps to 1, or to 10 when
+  `Otari-Budget-Scope` is not `user`. `rate_limited` maps to 2, `upstream_rate_limited` to 5,
+  `context_length_exceeded` to 3, `invalid_model` to 8, and `user_blocked` to 403
+  `User is blocked.`. A stream Otari ends with a coded error event becomes `data: {"error": N}`.
 
 Provision once per environment; this writes `OTARI_SERVICE_KEYS` to the env file:
 

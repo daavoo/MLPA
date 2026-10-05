@@ -17,6 +17,7 @@ from mlpa.core.config import (
 )
 from mlpa.core.errors import (
     USER_BLOCKED_DETAIL,
+    classify_otari_stream_error,
     classify_upstream_error,
     is_otari_user_blocked,
 )
@@ -264,11 +265,20 @@ async def stream_completion(
                         is_first_token = False
                         streaming_started = True
 
+                    stream_rejection = None
                     try:
                         chunk_str = chunk.decode("utf-8")
                         for line in chunk_str.split("\n"):
                             if line.startswith("data: ") and line != "data: [DONE]":
                                 data = json.loads(line[6:])
+                                # Otari ends a stream that fails after its first
+                                # byte with an error event carrying its code.
+                                stream_rejection = (
+                                    stream_rejection
+                                    or classify_otari_stream_error(
+                                        data, authorized_chat_request.user
+                                    )
+                                )
                                 # OpenAI-shaped streams (Otari's among them) send
                                 # "usage": null on every chunk but the last.
                                 if data.get("usage"):
@@ -303,6 +313,16 @@ async def stream_completion(
                                         )
                     except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
                         pass
+
+                    if stream_rejection is not None:
+                        if stream_rejection.log_message:
+                            log.warning(stream_rejection.log_message)
+                        record_chat_request_rejection(
+                            authorized_chat_request, stream_rejection.reason
+                        )
+                        availability_reason = stream_rejection.availability_reason()
+                        yield f'data: {{"error": {stream_rejection.error_code}}}\n\n'.encode()
+                        return
 
                     yield chunk
 

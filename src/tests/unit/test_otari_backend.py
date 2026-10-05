@@ -10,11 +10,16 @@ from mlpa.core.config import (
     ERROR_CODE_GLOBAL_BUDGET_LIMIT_EXCEEDED,
     ERROR_CODE_INVALID_MODEL_NAME,
     ERROR_CODE_RATE_LIMIT_EXCEEDED,
+    ERROR_CODE_REQUEST_TOO_LARGE,
     ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED,
     OTARI_API_ROOT,
     env,
 )
-from mlpa.core.errors import classify_upstream_error, is_otari_user_blocked
+from mlpa.core.errors import (
+    classify_otari_stream_error,
+    classify_upstream_error,
+    is_otari_user_blocked,
+)
 from mlpa.core.services.otari_service import OtariService, duration_seconds
 
 
@@ -140,24 +145,27 @@ async def test_blocking_patches_the_otari_user(otari, httpx_mock):
     assert json.loads(httpx_mock.get_requests()[-1].content) == {"blocked": True}
 
 
-async def test_startup_sync_upserts_budgets_and_narrows_a_rule_to_each_key(
-    otari, httpx_mock, monkeypatch
-):
+_AI_CONFIG = {
+    "ai": {
+        "feature": "smart-window",
+        "budget_id": "end-user-budget-ai",
+        "budget_duration": "1d",
+        "max_budget": 0.1,
+        "rpm_limit": 40,
+        "tpm_limit": 2000,
+    }
+}
+
+
+@pytest.fixture
+def ai_only(monkeypatch):
     # service_type_config is a cached_property, so the cached value is what to replace.
-    monkeypatch.setitem(
-        env.__dict__,
-        "service_type_config",
-        {
-            "ai": {
-                "feature": "smart-window",
-                "budget_id": "end-user-budget-ai",
-                "budget_duration": "1d",
-                "max_budget": 0.1,
-                "rpm_limit": 40,
-                "tpm_limit": 2000,
-            }
-        },
-    )
+    monkeypatch.setitem(env.__dict__, "service_type_config", _AI_CONFIG)
+
+
+async def test_provisioning_puts_the_per_user_limits_on_the_budget(
+    otari, httpx_mock, ai_only
+):
     httpx_mock.add_response(
         method="GET", url=f"{OTARI_API_ROOT}/budgets?limit=1000", json=[]
     )
@@ -165,30 +173,108 @@ async def test_startup_sync_upserts_budgets_and_narrows_a_rule_to_each_key(
         method="POST", url=f"{OTARI_API_ROOT}/budgets", json={"budget_id": "b-ai"}
     )
     httpx_mock.add_response(
-        method="GET",
-        url=f"{OTARI_API_ROOT}/keys?limit=1000",
-        json=[{"id": "k-ai", "key_name": "mlpa-ai", "end_user_budget_id": "b-ai"}],
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[]
     )
     httpx_mock.add_response(
-        method="GET", url=f"{OTARI_API_ROOT}/rate-limits", json={"rules": []}
+        method="POST", url=f"{OTARI_API_ROOT}/keys", json={"key": "sk-ai"}
     )
-    httpx_mock.add_response(method="POST", url=f"{OTARI_API_ROOT}/rate-limits", json={})
 
-    await otari.create_budget()
+    secrets = await otari.provision()
 
-    budget, rule = (
+    budget, key = (
         json.loads(r.content) for r in httpx_mock.get_requests() if r.method == "POST"
     )
     assert budget == {
         "name": "end-user-budget-ai",
         "max_budget": 0.1,
         "budget_duration_sec": 86400,
+        "rpm_limit": 40,
+        "tpm_limit": 2000,
     }
-    assert rule == {
-        "name": "mlpa-ai-users",
-        "per": "user",
-        "keys": ["k-ai"],
-        "rpm": 40,
-        "tpm": 2000,
-        "tpm_admission": "used",
+    assert key == {
+        "key_name": "mlpa-ai",
+        "user_id": "mlpa-ai",
+        "is_service_key": True,
+        "end_user_budget_id": "b-ai",
     }
+    assert secrets == {"ai": "sk-ai"}
+
+
+async def test_provisioning_refuses_duplicate_budgets(otari, httpx_mock, ai_only):
+    duplicate = {"name": "end-user-budget-ai", "budget_id": "b"}
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
+        json=[duplicate, duplicate],
+    )
+
+    with pytest.raises(RuntimeError, match="2 budgets named"):
+        await otari.provision()
+
+
+async def test_startup_only_reads(otari, httpx_mock, ai_only):
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
+        json=[{"name": "end-user-budget-ai", "budget_id": "b-ai"}],
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/keys?limit=1000",
+        json=[{"key_name": "mlpa-ai", "id": "k"}],
+    )
+
+    await otari.create_budget()
+
+    assert {r.method for r in httpx_mock.get_requests()} == {"GET"}
+    assert otari._budget_ids == {"end-user-budget-ai": "b-ai"}
+
+
+async def test_users_are_counted_from_the_total_header(
+    otari, httpx_mock, ai_only, monkeypatch
+):
+    monkeypatch.setitem(env.__dict__, "valid_service_types", ["ai"])
+    httpx_mock.add_response(
+        method="GET",
+        url=httpx.URL(
+            f"{OTARI_API_ROOT}/users",
+            params={"parent_user_id": "mlpa-ai", "limit": 1, "include_total": "true"},
+        ),
+        json=[{}],
+        headers={"Otari-Total-Count": "42"},
+    )
+
+    assert await otari.count_users_by_service_type() == {
+        "service_type_counts": {"ai": 42},
+        "total_users": 42,
+    }
+
+
+def test_the_code_in_the_body_is_enough():
+    match = classify_upstream_error(
+        error_text=json.dumps(
+            {"detail": "anything", "code": "context_length_exceeded"}
+        ),
+        status_code=400,
+        user="u:ai",
+    )
+
+    assert match is not None
+    assert match.error_code == ERROR_CODE_REQUEST_TOO_LARGE
+    assert match.http_status == 413
+
+
+def test_a_coded_stream_error_event_maps_to_mlpa_codes():
+    event = {
+        "error": {
+            "message": "x",
+            "type": "server_error",
+            "code": "upstream_rate_limited",
+        }
+    }
+
+    match = classify_otari_stream_error(event, "u:ai")
+
+    assert match is not None
+    assert match.error_code == ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED
+    assert classify_otari_stream_error({"choices": []}, "u:ai") is None

@@ -10,8 +10,8 @@ How MLPA's model maps onto Otari's:
   service key. A request's ``user`` ("<identity>:<service type>") names an end user
   of that owner, which Otari creates on first use with the key's end-user budget.
 - Each service type's budget is an Otari budget with MLPA's budget id as its name.
-- Each service type's per-user RPM and TPM is a ``rate_limits`` rule counted
-  ``per: user`` and narrowed to that service type's key.
+- Each service type's per-user RPM and TPM are that budget's ``rpm_limit`` and
+  ``tpm_limit``, so moving a user to another budget moves its limits too.
 """
 
 import re
@@ -48,10 +48,6 @@ def owner_of(service_type: str) -> str:
 
 def key_name_of(service_type: str) -> str:
     return f"{env.OTARI_OWNER_PREFIX}{service_type}"
-
-
-def rule_name_of(service_type: str) -> str:
-    return f"{env.OTARI_OWNER_PREFIX}{service_type}-users"
 
 
 class OtariService:
@@ -171,10 +167,16 @@ class OtariService:
         return self._as_mlpa_user(updated)
 
     async def _count(self, service_type: str) -> int:
-        body = await self._request(
-            "GET", "/users/count", params={"parent_user_id": owner_of(service_type)}
+        response = await self.client.get(
+            "/users",
+            params={
+                "parent_user_id": owner_of(service_type),
+                "limit": 1,
+                "include_total": True,
+            },
         )
-        return int(body["total"])
+        response.raise_for_status()
+        return int(response.headers["otari-total-count"])
 
     async def list_users(self, limit: int = 50, offset: int = 0) -> dict:
         """Users across every service type, in service-type order."""
@@ -243,115 +245,110 @@ class OtariService:
                 return True
         return False
 
-    # Budgets, keys and limits
+    # Budgets and keys
 
-    async def _sync_budgets(self) -> None:
-        existing = {
-            budget.get("name"): budget
-            for budget in await self._request("GET", "/budgets", params={"limit": 1000})
-        }
+    async def _budgets_by_name(self) -> dict[str, list[dict[str, Any]]]:
+        by_name: dict[str, list[dict[str, Any]]] = {}
+        for budget in await self._request("GET", "/budgets", params={"limit": 1000}):
+            by_name.setdefault(budget.get("name"), []).append(budget)
+        return by_name
+
+    def _learn_budget(self, name: str, budget_id: str) -> None:
+        self._budget_ids[name] = budget_id
+        self._budget_names[budget_id] = name
+
+    async def _keys_by_name(self) -> dict[str, dict[str, Any]]:
+        keys = await self._request("GET", "/keys", params={"limit": 1000})
+        return {key["key_name"]: key for key in keys if key.get("is_active", True)}
+
+    async def provision(self, *, rotate: bool = False) -> dict[str, str]:
+        """Write MLPA's budgets and service keys to Otari, returning the key secrets it could read.
+
+        The one writer: run as a deploy step (scripts/otari_provision.py), never
+        by the serving replicas, which would race each other into duplicate
+        budgets and overwrite edits made in Otari. A key's secret is shown once,
+        when it is created or rotated, so an existing key's secret is only
+        returned when ``rotate`` is set.
+        """
+        budgets = await self._budgets_by_name()
+        for name, found in budgets.items():
+            if name and len(found) > 1:
+                raise RuntimeError(
+                    f"Otari has {len(found)} budgets named {name!r}; remove all but one"
+                )
         for service_type, config in env.service_type_config.items():
             name = config["budget_id"]
             body = {
                 "name": name,
                 "max_budget": config["max_budget"],
                 "budget_duration_sec": duration_seconds(config["budget_duration"]),
+                # Per user per minute; tokens are counted on what requests used, as LiteLLM does.
+                "rpm_limit": config["rpm_limit"],
+                "tpm_limit": config["tpm_limit"],
             }
-            if name in existing:
+            if name in budgets:
                 budget = await self._request(
-                    "PATCH", f"/budgets/{existing[name]['budget_id']}", json=body
+                    "PATCH", f"/budgets/{budgets[name][0]['budget_id']}", json=body
                 )
             else:
                 budget = await self._request("POST", "/budgets", json=body)
-            self._budget_ids[name] = budget["budget_id"]
-            self._budget_names[budget["budget_id"]] = name
+            self._learn_budget(name, budget["budget_id"])
             logger.info(
-                f"Budget created/updated: budget_id={name}, service_type={service_type}, "
-                f"max_budget={config['max_budget']}"
+                f"Budget provisioned: budget_id={name}, service_type={service_type}"
             )
 
-    async def _keys_by_name(self) -> dict[str, dict[str, Any]]:
-        keys = await self._request("GET", "/keys", params={"limit": 1000})
-        return {key["key_name"]: key for key in keys if key.get("is_active", True)}
-
-    async def provision_keys(self, *, rotate: bool = False) -> dict[str, str]:
-        """Create each service type's service key, returning the secrets it could read.
-
-        A key's secret is shown once, when it is created or rotated, so an existing
-        key's secret is only returned when ``rotate`` is set.
-        """
-        await self._sync_budgets()
-        existing = await self._keys_by_name()
+        keys = await self._keys_by_name()
         secrets: dict[str, str] = {}
         for service_type, config in env.service_type_config.items():
-            name = key_name_of(service_type)
             budget_id = self._budget_ids[config["budget_id"]]
-            key = existing.get(name)
+            key = keys.get(key_name_of(service_type))
             if key is None:
                 created = await self._request(
                     "POST",
                     "/keys",
                     json={
-                        "key_name": name,
+                        "key_name": key_name_of(service_type),
                         "user_id": owner_of(service_type),
                         "is_service_key": True,
                         "end_user_budget_id": budget_id,
                     },
                 )
                 secrets[service_type] = created["key"]
-            elif rotate:
-                rotated = await self._request("POST", f"/keys/{key['id']}/rotate")
-                secrets[service_type] = rotated["key"]
-        await self._sync_keys_and_limits()
-        return secrets
-
-    async def _sync_keys_and_limits(self) -> None:
-        keys = await self._keys_by_name()
-        rules = {
-            rule["name"]: rule
-            for rule in (await self._request("GET", "/rate-limits"))["rules"]
-        }
-        for service_type, config in env.service_type_config.items():
-            key = keys.get(key_name_of(service_type))
-            if key is None:
-                logger.error(
-                    f"Otari has no service key for service type {service_type}; "
-                    "run scripts/otari_provision.py"
-                )
                 continue
-            budget_id = self._budget_ids[config["budget_id"]]
             if key.get("end_user_budget_id") != budget_id:
                 await self._request(
                     "PATCH",
                     f"/keys/{key['id']}",
                     json={"end_user_budget_id": budget_id},
                 )
-            name = rule_name_of(service_type)
-            limits = {
-                "per": "user",
-                "keys": [key["id"]],
-                "rpm": config["rpm_limit"],
-                "tpm": config["tpm_limit"],
-                # LiteLLM counts the tokens a user used; MLPA sends a large
-                # max_tokens that an estimate would refuse every request on.
-                "tpm_admission": "used",
-            }
-            if name in rules:
-                await self._request("PATCH", f"/rate-limits/{name}", json=limits)
-            else:
-                await self._request(
-                    "POST", "/rate-limits", json={"name": name, **limits}
-                )
+            if rotate:
+                rotated = await self._request("POST", f"/keys/{key['id']}/rotate")
+                secrets[service_type] = rotated["key"]
+        return secrets
 
     async def create_budget(self) -> None:
-        """Bring Otari's budgets, key budgets and per-user limits in line with MLPA's config.
+        """Learn the Otari ids of MLPA's budgets, and say what provisioning has not done.
 
-        Called at startup, like the LiteLLM budget upsert it replaces. Keys are
-        not created here: their secrets have to reach every MLPA replica, which
-        scripts/otari_provision.py does through OTARI_SERVICE_KEYS.
+        Called at startup in place of the LiteLLM budget upsert, and read-only:
+        scripts/otari_provision.py is what writes budgets and keys.
         """
         try:
-            await self._sync_budgets()
-            await self._sync_keys_and_limits()
+            budgets = await self._budgets_by_name()
+            keys = await self._keys_by_name()
         except Exception as e:
-            logger.error(f"Error syncing budgets and limits to Otari: {e}")
+            logger.error(f"Error reading budgets from Otari: {e}")
+            return
+        for service_type, config in env.service_type_config.items():
+            name = config["budget_id"]
+            found = budgets.get(name, [])
+            if len(found) != 1:
+                logger.error(
+                    f"Otari has {len(found)} budgets named {name!r} (service type {service_type}), "
+                    "expected 1; run scripts/otari_provision.py"
+                )
+            if found:
+                self._learn_budget(name, found[0]["budget_id"])
+            if key_name_of(service_type) not in keys:
+                logger.error(
+                    f"Otari has no service key for service type {service_type}; run scripts/otari_provision.py"
+                )
