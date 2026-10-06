@@ -63,16 +63,15 @@ class Env(BaseSettings):
     ALLOW_CUSTOM_VIRTUAL_KEY: bool = False
 
     # Which gateway MLPA sends inference to. "otari" replaces LiteLLM with Otari:
-    # one Otari service key per service type, users read and managed through
+    # one Otari service key for every service type, users read and managed through
     # Otari's API rather than LiteLLM's tables.
     GATEWAY_BACKEND: Literal["litellm", "otari"] = "litellm"
     OTARI_API_BASE: str = "http://localhost:8000"
     OTARI_MASTER_KEY: str = "sk-otari-default"
-    # JSON object mapping each service type to its Otari service key, written by
-    # scripts/otari_provision.py.
-    OTARI_SERVICE_KEYS: dict[str, str] = {}
-    # Otari user that owns each service type's key and end users: "<prefix><service type>".
-    OTARI_OWNER_PREFIX: str = "mlpa-"
+    # MLPA's Otari service key, written by scripts/otari_provision.py.
+    OTARI_SERVICE_KEY: str = ""
+    # The Otari user that owns the service key and every end user, and the key's name.
+    OTARI_OWNER_USER: str = "mlpa"
     # End users known to exist in Otari, remembered so the signup cap is checked
     # without a lookup on every request.
     OTARI_KNOWN_USERS_CACHE_SIZE: int = 100_000
@@ -642,16 +641,21 @@ def resolve_litellm_virtual_auth_headers(
     """
     Resolve virtual key to be forwarded to litellm, if passing custom virtual key
     the custom key will be used. Otherwise, the default LITELLM_VIRTUAL_AUTH_HEADERS
-    will be used. With GATEWAY_BACKEND=otari the default is the Otari service
-    key of the request's service type.
+    will be used. With GATEWAY_BACKEND=otari the default is MLPA's Otari service
+    key, with the budget of the request's service type, which Otari puts a new
+    end user on.
     """
     if custom_virtual_key is None and USE_OTARI:
-        key = env.OTARI_SERVICE_KEYS.get(service_type or "")
-        if not key:
-            raise RuntimeError(
-                f"No Otari service key for service type {service_type!r}; run scripts/otari_provision.py"
-            )
-        return {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+        if not env.OTARI_SERVICE_KEY:
+            raise RuntimeError("No Otari service key; run scripts/otari_provision.py")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {env.OTARI_SERVICE_KEY}",
+        }
+        config = env.service_type_config.get(service_type or "")
+        if config is not None:
+            headers[OTARI_HEADER_END_USER_BUDGET] = config["budget_id"]
+        return headers
     if custom_virtual_key is None:
         return LITELLM_VIRTUAL_AUTH_HEADERS
     return {
@@ -670,6 +674,8 @@ LITELLM_HEADER_RESPONSE_COST = "x-litellm-response-cost"
 
 # Otari's stable refusal codes (Otari-Error-Code), and the headers beside them.
 OTARI_HEADER_ERROR_CODE = "otari-error-code"
+# Names the budget a new end user starts on, and, on a response, the one it is on.
+OTARI_HEADER_END_USER_BUDGET = "otari-end-user-budget"
 OTARI_HEADER_BUDGET_SCOPE = "otari-budget-scope"
 
 # Privacy Filter

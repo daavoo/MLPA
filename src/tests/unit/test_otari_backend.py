@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 
+from mlpa.core import config as config_module
 from mlpa.core.config import (
     ERROR_CODE_BUDGET_LIMIT_EXCEEDED,
     ERROR_CODE_GLOBAL_BUDGET_LIMIT_EXCEEDED,
@@ -14,6 +15,7 @@ from mlpa.core.config import (
     ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED,
     OTARI_API_ROOT,
     env,
+    resolve_litellm_virtual_auth_headers,
 )
 from mlpa.core.errors import (
     classify_otari_stream_error,
@@ -91,24 +93,28 @@ async def otari():
     await service.disconnect()
 
 
-async def test_an_end_user_is_found_by_owner_and_external_id(otari, httpx_mock):
+_KEY = {
+    "id": "k1",
+    "key_name": "mlpa",
+    "is_active": True,
+    "end_user_budget_ids": ["end-user-budget-ai"],
+    "end_user_budget_id": "end-user-budget-ai",
+}
+
+
+async def test_an_end_user_is_read_by_the_id_mlpa_names_it_by(otari, httpx_mock):
+    otari._key_id = "k1"
     httpx_mock.add_response(
         method="GET",
-        url=httpx.URL(
-            f"{OTARI_API_ROOT}/users",
-            params={"parent_user_id": "mlpa-ai", "external_id": "fxa1:ai", "limit": 1},
-        ),
-        json=[
-            {
-                "user_id": "eu_1",
-                "external_id": "fxa1:ai",
-                "blocked": True,
-                "spend": 0.02,
-                "budget_id": "b-ai",
-            }
-        ],
+        url=f"{OTARI_API_ROOT}/keys/k1/end-users/fxa1%3Aai",
+        json={
+            "user_id": "eu_1",
+            "external_id": "fxa1:ai",
+            "blocked": True,
+            "spend": 0.02,
+            "budget_id": "end-user-budget-ai",
+        },
     )
-    otari._budget_names["b-ai"] = "end-user-budget-ai"
 
     user = await otari.get_user("fxa1:ai")
 
@@ -120,29 +126,58 @@ async def test_an_end_user_is_found_by_owner_and_external_id(otari, httpx_mock):
     assert otari.is_known("fxa1:ai")
 
 
-async def test_blocking_patches_the_otari_user(otari, httpx_mock):
+async def test_an_unknown_end_user_is_none(otari, httpx_mock):
+    otari._key_id = "k1"
     httpx_mock.add_response(
         method="GET",
-        url=httpx.URL(
-            f"{OTARI_API_ROOT}/users",
-            params={
-                "parent_user_id": "mlpa-memories",
-                "external_id": "fxa1:memories",
-                "limit": 1,
-            },
-        ),
-        json=[{"user_id": "eu_2", "external_id": "fxa1:memories"}],
+        url=f"{OTARI_API_ROOT}/keys/k1/end-users/new%3Aai",
+        status_code=404,
+        json={"detail": "End user 'new:ai' not found"},
+    )
+
+    assert await otari.get_user("new:ai") is None
+    assert not otari.is_known("new:ai")
+
+
+async def test_blocking_and_moving_patch_the_end_user(otari, httpx_mock):
+    otari._key_id = "k1"
+    url = f"{OTARI_API_ROOT}/keys/k1/end-users/fxa1%3Amemories"
+    httpx_mock.add_response(
+        method="PATCH",
+        url=url,
+        json={"user_id": "eu_2", "external_id": "fxa1:memories", "blocked": True},
     )
     httpx_mock.add_response(
         method="PATCH",
-        url=f"{OTARI_API_ROOT}/users/eu_2",
-        json={"user_id": "eu_2", "external_id": "fxa1:memories", "blocked": True},
+        url=url,
+        json={"user_id": "eu_2", "external_id": "fxa1:memories", "budget_id": "b-dev"},
     )
 
-    user = await otari.block_user("fxa1:memories")
+    blocked = await otari.block_user("fxa1:memories")
+    moved = await otari.update_user_budget("fxa1:memories", "b-dev")
 
-    assert user["blocked"] is True
-    assert json.loads(httpx_mock.get_requests()[-1].content) == {"blocked": True}
+    first, second = httpx_mock.get_requests()
+    assert blocked["blocked"] is True
+    assert json.loads(first.content) == {"blocked": True}
+    assert moved["budget_id"] == "b-dev"
+    assert json.loads(second.content) == {"budget_id": "b-dev"}
+
+
+async def test_the_key_id_is_looked_up_once(otari, httpx_mock):
+    httpx_mock.add_response(
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/keys/k1/end-users/a%3Aai",
+        json={"user_id": "eu_a", "external_id": "a:ai"},
+        is_reusable=True,
+    )
+
+    await otari.get_user("a:ai")
+    await otari.get_user("a:ai")
+
+    assert [r.method for r in httpx_mock.get_requests()] == ["GET", "GET", "GET"]
 
 
 _AI_CONFIG = {
@@ -163,91 +198,122 @@ def ai_only(monkeypatch):
     monkeypatch.setitem(env.__dict__, "service_type_config", _AI_CONFIG)
 
 
-async def test_provisioning_puts_the_per_user_limits_on_the_budget(
+async def test_provisioning_puts_budgets_by_id_and_one_key_listing_them(
     otari, httpx_mock, ai_only
 ):
     httpx_mock.add_response(
-        method="GET", url=f"{OTARI_API_ROOT}/budgets?limit=1000", json=[]
-    )
-    httpx_mock.add_response(
-        method="POST", url=f"{OTARI_API_ROOT}/budgets", json={"budget_id": "b-ai"}
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/end-user-budget-ai",
+        json={"budget_id": "end-user-budget-ai"},
     )
     httpx_mock.add_response(
         method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[]
     )
     httpx_mock.add_response(
-        method="POST", url=f"{OTARI_API_ROOT}/keys", json={"key": "sk-ai"}
+        method="POST", url=f"{OTARI_API_ROOT}/keys", json={"id": "k1", "key": "sk-1"}
     )
 
-    secrets = await otari.provision()
+    secret = await otari.provision()
 
-    budget, key = (
-        json.loads(r.content) for r in httpx_mock.get_requests() if r.method == "POST"
-    )
-    assert budget == {
+    put, _get, post = httpx_mock.get_requests()
+    assert json.loads(put.content) == {
         "name": "end-user-budget-ai",
         "max_budget": 0.1,
         "budget_duration_sec": 86400,
         "rpm_limit": 40,
         "tpm_limit": 2000,
     }
-    assert key == {
-        "key_name": "mlpa-ai",
-        "user_id": "mlpa-ai",
+    assert json.loads(post.content) == {
+        "key_name": "mlpa",
+        "user_id": "mlpa",
         "is_service_key": True,
-        "end_user_budget_id": "b-ai",
+        "end_user_budget_ids": ["end-user-budget-ai"],
+        "end_user_budget_id": "end-user-budget-ai",
     }
-    assert secrets == {"ai": "sk-ai"}
+    assert secret == "sk-1"
+    assert otari._key_id == "k1"
 
 
-async def test_provisioning_refuses_duplicate_budgets(otari, httpx_mock, ai_only):
-    duplicate = {"name": "end-user-budget-ai", "budget_id": "b"}
+async def test_provisioning_again_leaves_a_matching_key_alone(
+    otari, httpx_mock, ai_only
+):
     httpx_mock.add_response(
-        method="GET",
-        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
-        json=[duplicate, duplicate],
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/end-user-budget-ai",
+        json={"budget_id": "end-user-budget-ai"},
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
     )
 
-    with pytest.raises(RuntimeError, match="2 budgets named"):
-        await otari.provision()
+    assert await otari.provision() is None
+    assert {r.method for r in httpx_mock.get_requests()} == {"PUT", "GET"}
 
 
 async def test_startup_only_reads(otari, httpx_mock, ai_only):
     httpx_mock.add_response(
-        method="GET",
-        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
-        json=[{"name": "end-user-budget-ai", "budget_id": "b-ai"}],
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{OTARI_API_ROOT}/keys?limit=1000",
-        json=[{"key_name": "mlpa-ai", "id": "k"}],
+        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
+        json=[{"budget_id": "end-user-budget-ai", "user_count": 0}],
     )
 
     await otari.create_budget()
 
     assert {r.method for r in httpx_mock.get_requests()} == {"GET"}
-    assert otari._budget_ids == {"end-user-budget-ai": "b-ai"}
+    assert otari._key_id == "k1"
 
 
-async def test_users_are_counted_from_the_total_header(
-    otari, httpx_mock, ai_only, monkeypatch
+async def test_users_are_counted_by_their_service_types_budget(
+    otari, httpx_mock, ai_only
 ):
-    monkeypatch.setitem(env.__dict__, "valid_service_types", ["ai"])
     httpx_mock.add_response(
         method="GET",
-        url=httpx.URL(
-            f"{OTARI_API_ROOT}/users",
-            params={"parent_user_id": "mlpa-ai", "limit": 1, "include_total": "true"},
-        ),
-        json=[{}],
-        headers={"Otari-Total-Count": "42"},
+        url=f"{OTARI_API_ROOT}/budgets?limit=1000",
+        json=[
+            {"budget_id": "end-user-budget-ai", "user_count": 42},
+            {"budget_id": "someone-elses", "user_count": 7},
+        ],
     )
 
     assert await otari.count_users_by_service_type() == {
         "service_type_counts": {"ai": 42},
         "total_users": 42,
     }
+
+
+async def test_users_are_listed_under_the_one_owner(otari, httpx_mock):
+    httpx_mock.add_response(
+        method="GET",
+        url=httpx.URL(
+            f"{OTARI_API_ROOT}/users",
+            params={
+                "parent_user_id": "mlpa",
+                "skip": 10,
+                "limit": 2,
+                "include_total": "true",
+            },
+        ),
+        json=[{"user_id": "eu_1", "external_id": "a:ai"}],
+        headers={"Otari-Total-Count": "11"},
+    )
+
+    listed = await otari.list_users(limit=2, offset=10)
+
+    assert listed["total"] == 11
+    assert [user["user_id"] for user in listed["users"]] == ["a:ai"]
+
+
+def test_requests_name_the_service_types_budget(monkeypatch, ai_only):
+    monkeypatch.setattr(config_module, "USE_OTARI", True)
+    monkeypatch.setattr(env, "OTARI_SERVICE_KEY", "sk-1")
+
+    headers = resolve_litellm_virtual_auth_headers(service_type="ai")
+
+    assert headers["Authorization"] == "Bearer sk-1"
+    assert headers["otari-end-user-budget"] == "end-user-budget-ai"
 
 
 def test_the_code_in_the_body_is_enough():

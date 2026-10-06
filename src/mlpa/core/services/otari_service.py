@@ -6,10 +6,12 @@ call it unchanged.
 
 How MLPA's model maps onto Otari's:
 
-- Each service type has an Otari owner user (``mlpa-<service type>``) holding one
-  service key. A request's ``user`` ("<identity>:<service type>") names an end user
-  of that owner, which Otari creates on first use with the key's end-user budget.
-- Each service type's budget is an Otari budget with MLPA's budget id as its name.
+- One Otari service key, owned by the Otari user ``OTARI_OWNER_USER``, serves
+  every service type. A request's ``user`` ("<identity>:<service type>") names an
+  end user of that owner, which Otari creates on its first request on the budget
+  the ``Otari-End-User-Budget`` header names: the service type's.
+- Each service type's budget is an Otari budget under MLPA's own budget id, which
+  the key lists among the budgets it may assign.
 - Each service type's per-user RPM and TPM are that budget's ``rpm_limit`` and
   ``tpm_limit``, so moving a user to another budget moves its limits too.
 """
@@ -17,6 +19,7 @@ How MLPA's model maps onto Otari's:
 import re
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
@@ -42,19 +45,16 @@ def duration_seconds(duration: str) -> int:
     return int(match.group(1)) * _DURATION_SECONDS[match.group(2)]
 
 
-def owner_of(service_type: str) -> str:
-    return f"{env.OTARI_OWNER_PREFIX}{service_type}"
-
-
-def key_name_of(service_type: str) -> str:
-    return f"{env.OTARI_OWNER_PREFIX}{service_type}"
+def budget_ids() -> list[str]:
+    """MLPA's budget ids, one per service type, in service-type order and without repeats."""
+    return list(dict.fromkeys(c["budget_id"] for c in env.service_type_config.values()))
 
 
 class OtariService:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
-        self._budget_ids: dict[str, str] = {}  # MLPA budget id -> Otari budget id
-        self._budget_names: dict[str, str] = {}  # Otari budget id -> MLPA budget id
+        # The service key's id, which addresses its end users. Learned at startup.
+        self._key_id: str | None = None
         self._known_users: OrderedDict[str, None] = OrderedDict()
 
     @property
@@ -101,15 +101,13 @@ class OtariService:
     def is_known(self, user_id: str) -> bool:
         return user_id in self._known_users
 
-    def _as_mlpa_user(self, user: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _as_mlpa_user(user: dict[str, Any]) -> dict[str, Any]:
         """An Otari end user in the shape MLPA read from LiteLLM_EndUserTable."""
-        budget_id = user.get("budget_id")
         return {
             "user_id": user.get("external_id"),
             "otari_user_id": user.get("user_id"),
-            "budget_id": self._budget_names.get(budget_id, budget_id)
-            if budget_id
-            else None,
+            "budget_id": user.get("budget_id"),
             "blocked": bool(user.get("blocked")),
             "spend": user.get("spend", 0.0),
             "budget_started_at": user.get("budget_started_at"),
@@ -117,123 +115,108 @@ class OtariService:
             "created_at": user.get("created_at"),
         }
 
-    async def _find(self, user_id: str) -> dict[str, Any] | None:
-        _base, _sep, service_type = user_id.partition(":")
-        if not service_type:
+    async def _key(self) -> str:
+        if self._key_id is None:
+            await self._learn_key()
+        if self._key_id is None:
+            raise RuntimeError(
+                "Otari has no MLPA service key; run scripts/otari_provision.py"
+            )
+        return self._key_id
+
+    async def _end_user(
+        self, method: str, user_id: str, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        """One call on the end user MLPA names ``user_id``, or None when Otari has none."""
+        path = f"/keys/{await self._key()}/end-users/{quote(user_id, safe='')}"
+        response = await self.client.request(method, path, **kwargs)
+        if response.status_code == 404:
             return None
-        users = await self._request(
-            "GET",
-            "/users",
-            params={
-                "parent_user_id": owner_of(service_type),
-                "external_id": user_id,
-                "limit": 1,
-            },
-        )
-        return users[0] if users else None
+        response.raise_for_status()
+        return response.json()
 
     async def get_user(self, user_id: str) -> dict[str, Any] | None:
-        user = await self._find(user_id)
+        user = await self._end_user("GET", user_id)
         if user is None:
             return None
         self.remember(user_id)
         return self._as_mlpa_user(user)
 
     async def update_user_budget(self, user_id: str, budget_id: str) -> dict:
-        user = await self._find(user_id)
-        if user is None:
+        updated = await self._end_user("PATCH", user_id, json={"budget_id": budget_id})
+        if updated is None:
             raise HTTPException(status_code=404, detail="User not found.")
-        otari_budget_id = self._budget_ids.get(budget_id)
-        if otari_budget_id is None:
-            raise HTTPException(
-                status_code=500, detail={"error": "Error updating user budget"}
-            )
-        updated = await self._request(
-            "PATCH", f"/users/{user['user_id']}", json={"budget_id": otari_budget_id}
-        )
         logger.info(f"User {user_id} budget updated to {budget_id} successfully.")
         return self._as_mlpa_user(updated)
 
     async def block_user(self, user_id: str, blocked: bool = True) -> dict:
-        user = await self._find(user_id)
-        if user is None:
+        updated = await self._end_user("PATCH", user_id, json={"blocked": blocked})
+        if updated is None:
             raise HTTPException(status_code=404, detail="User not found.")
-        updated = await self._request(
-            "PATCH", f"/users/{user['user_id']}", json={"blocked": blocked}
-        )
         logger.info(
             f"User {user_id} {'blocked' if blocked else 'unblocked'} successfully."
         )
         return self._as_mlpa_user(updated)
 
-    async def _count(self, service_type: str) -> int:
+    async def list_users(self, limit: int = 50, offset: int = 0) -> dict:
         response = await self.client.get(
             "/users",
             params={
-                "parent_user_id": owner_of(service_type),
-                "limit": 1,
+                "parent_user_id": env.OTARI_OWNER_USER,
+                "skip": offset,
+                "limit": limit,
                 "include_total": True,
             },
         )
         response.raise_for_status()
-        return int(response.headers["otari-total-count"])
-
-    async def list_users(self, limit: int = 50, offset: int = 0) -> dict:
-        """Users across every service type, in service-type order."""
-        counts = {st: await self._count(st) for st in env.valid_service_types}
-        users: list[dict[str, Any]] = []
-        skip = offset
-        for service_type, count in counts.items():
-            if len(users) >= limit:
-                break
-            if skip >= count:
-                skip -= count
-                continue
-            page = await self._request(
-                "GET",
-                "/users",
-                params={
-                    "parent_user_id": owner_of(service_type),
-                    "skip": skip,
-                    "limit": limit - len(users),
-                },
-            )
-            users.extend(self._as_mlpa_user(user) for user in page)
-            skip = 0
         return {
-            "users": users,
-            "total": sum(counts.values()),
+            "users": [self._as_mlpa_user(user) for user in response.json()],
+            "total": int(response.headers["otari-total-count"]),
             "limit": limit,
             "offset": offset,
         }
 
     async def count_users_by_service_type(self) -> dict:
-        counts = {st: await self._count(st) for st in env.valid_service_types}
+        """Users per service type, counted as the users on each service type's budget.
+
+        Otari counts users per budget, so a user moved to another service type's
+        budget (a tester on ai-dev) counts under that one, where LiteLLM counted it
+        under the service type in its id.
+        """
+        budgets = await self._request("GET", "/budgets", params={"limit": _PAGE})
+        users_on = {budget["budget_id"]: budget["user_count"] for budget in budgets}
+        counts = {
+            service_type: users_on.get(config["budget_id"], 0)
+            for service_type, config in env.service_type_config.items()
+        }
         counts = {st: count for st, count in counts.items() if count}
         return {"service_type_counts": counts, "total_users": sum(counts.values())}
 
     async def list_managed_base_identities(
         self, managed_service_types: list[str]
     ) -> list[str]:
+        managed = set(managed_service_types)
         identities: set[str] = set()
-        for service_type in managed_service_types:
-            skip = 0
-            while True:
-                page = await self._request(
-                    "GET",
-                    "/users",
-                    params={
-                        "parent_user_id": owner_of(service_type),
-                        "skip": skip,
-                        "limit": _PAGE,
-                    },
+        skip = 0
+        while True:
+            page = await self._request(
+                "GET",
+                "/users",
+                params={
+                    "parent_user_id": env.OTARI_OWNER_USER,
+                    "skip": skip,
+                    "limit": _PAGE,
+                },
+            )
+            for user in page:
+                base, _sep, service_type = (user.get("external_id") or "").partition(
+                    ":"
                 )
-                identities.update(
-                    (user.get("external_id") or "").partition(":")[0] for user in page
-                )
-                if len(page) < _PAGE:
-                    break
-                skip += _PAGE
+                if service_type in managed:
+                    identities.add(base)
+            if len(page) < _PAGE:
+                break
+            skip += _PAGE
         identities.discard("")
         return sorted(identities)
 
@@ -241,114 +224,108 @@ class OtariService:
         self, base_identity: str, managed_service_types: list[str]
     ) -> bool:
         for service_type in managed_service_types:
-            if await self._find(f"{base_identity}:{service_type}") is not None:
+            if await self._end_user("GET", f"{base_identity}:{service_type}"):
                 return True
         return False
 
-    # Budgets and keys
+    # Budgets and the key
 
-    async def _budgets_by_name(self) -> dict[str, list[dict[str, Any]]]:
-        by_name: dict[str, list[dict[str, Any]]] = {}
-        for budget in await self._request("GET", "/budgets", params={"limit": 1000}):
-            by_name.setdefault(budget.get("name"), []).append(budget)
-        return by_name
+    async def _service_key(self) -> dict[str, Any] | None:
+        keys = await self._request("GET", "/keys", params={"limit": _PAGE})
+        for key in keys:
+            if key.get("key_name") == env.OTARI_OWNER_USER and key.get(
+                "is_active", True
+            ):
+                return key
+        return None
 
-    def _learn_budget(self, name: str, budget_id: str) -> None:
-        self._budget_ids[name] = budget_id
-        self._budget_names[budget_id] = name
+    async def _learn_key(self) -> dict[str, Any] | None:
+        key = await self._service_key()
+        self._key_id = key["id"] if key is not None else None
+        return key
 
-    async def _keys_by_name(self) -> dict[str, dict[str, Any]]:
-        keys = await self._request("GET", "/keys", params={"limit": 1000})
-        return {key["key_name"]: key for key in keys if key.get("is_active", True)}
-
-    async def provision(self, *, rotate: bool = False) -> dict[str, str]:
-        """Write MLPA's budgets and service keys to Otari, returning the key secrets it could read.
+    async def provision(self, *, rotate: bool = False) -> str | None:
+        """Write MLPA's budgets and its service key to Otari, returning the key's secret when it is known.
 
         The one writer: run as a deploy step (scripts/otari_provision.py), never
-        by the serving replicas, which would race each other into duplicate
-        budgets and overwrite edits made in Otari. A key's secret is shown once,
-        when it is created or rotated, so an existing key's secret is only
-        returned when ``rotate`` is set.
+        by the serving replicas, which would overwrite edits made in Otari. Each
+        budget is put under MLPA's own budget id, so running it again changes
+        nothing. A key's secret is shown once, when it is created or rotated, so an
+        existing key's secret is only returned when ``rotate`` is set.
         """
-        budgets = await self._budgets_by_name()
-        for name, found in budgets.items():
-            if name and len(found) > 1:
-                raise RuntimeError(
-                    f"Otari has {len(found)} budgets named {name!r}; remove all but one"
-                )
         for service_type, config in env.service_type_config.items():
-            name = config["budget_id"]
-            body = {
-                "name": name,
-                "max_budget": config["max_budget"],
-                "budget_duration_sec": duration_seconds(config["budget_duration"]),
-                # Per user per minute; tokens are counted on what requests used, as LiteLLM does.
-                "rpm_limit": config["rpm_limit"],
-                "tpm_limit": config["tpm_limit"],
-            }
-            if name in budgets:
-                budget = await self._request(
-                    "PATCH", f"/budgets/{budgets[name][0]['budget_id']}", json=body
-                )
-            else:
-                budget = await self._request("POST", "/budgets", json=body)
-            self._learn_budget(name, budget["budget_id"])
+            await self._request(
+                "PUT",
+                f"/budgets/{config['budget_id']}",
+                json={
+                    "name": config["budget_id"],
+                    "max_budget": config["max_budget"],
+                    "budget_duration_sec": duration_seconds(config["budget_duration"]),
+                    # Per user per minute; tokens are counted on what requests used, as LiteLLM does.
+                    "rpm_limit": config["rpm_limit"],
+                    "tpm_limit": config["tpm_limit"],
+                },
+            )
             logger.info(
-                f"Budget provisioned: budget_id={name}, service_type={service_type}"
+                f"Budget provisioned: budget_id={config['budget_id']}, service_type={service_type}"
             )
 
-        keys = await self._keys_by_name()
-        secrets: dict[str, str] = {}
-        for service_type, config in env.service_type_config.items():
-            budget_id = self._budget_ids[config["budget_id"]]
-            key = keys.get(key_name_of(service_type))
-            if key is None:
-                created = await self._request(
-                    "POST",
-                    "/keys",
-                    json={
-                        "key_name": key_name_of(service_type),
-                        "user_id": owner_of(service_type),
-                        "is_service_key": True,
-                        "end_user_budget_id": budget_id,
-                    },
-                )
-                secrets[service_type] = created["key"]
-                continue
-            if key.get("end_user_budget_id") != budget_id:
-                await self._request(
-                    "PATCH",
-                    f"/keys/{key['id']}",
-                    json={"end_user_budget_id": budget_id},
-                )
-            if rotate:
-                rotated = await self._request("POST", f"/keys/{key['id']}/rotate")
-                secrets[service_type] = rotated["key"]
-        return secrets
+        listed = budget_ids()
+        # MLPA names a budget on every request, so the default only catches a
+        # request that somehow names none: it is the first service type's.
+        assignment = {"end_user_budget_ids": listed, "end_user_budget_id": listed[0]}
+        key = await self._learn_key()
+        if key is None:
+            created = await self._request(
+                "POST",
+                "/keys",
+                json={
+                    "key_name": env.OTARI_OWNER_USER,
+                    "user_id": env.OTARI_OWNER_USER,
+                    "is_service_key": True,
+                    **assignment,
+                },
+            )
+            self._key_id = created["id"]
+            return created["key"]
+        if (
+            key.get("end_user_budget_ids") != listed
+            or key.get("end_user_budget_id") != listed[0]
+        ):
+            await self._request("PATCH", f"/keys/{key['id']}", json=assignment)
+        if rotate:
+            rotated = await self._request("POST", f"/keys/{key['id']}/rotate")
+            return rotated["key"]
+        return None
 
     async def create_budget(self) -> None:
-        """Learn the Otari ids of MLPA's budgets, and say what provisioning has not done.
+        """Learn the service key's id, and say what provisioning has not done.
 
         Called at startup in place of the LiteLLM budget upsert, and read-only:
-        scripts/otari_provision.py is what writes budgets and keys.
+        scripts/otari_provision.py is what writes budgets and the key.
         """
         try:
-            budgets = await self._budgets_by_name()
-            keys = await self._keys_by_name()
+            key = await self._learn_key()
+            budgets = await self._request("GET", "/budgets", params={"limit": _PAGE})
         except Exception as e:
-            logger.error(f"Error reading budgets from Otari: {e}")
+            logger.error(f"Error reading MLPA's budgets and key from Otari: {e}")
             return
+        if key is None:
+            logger.error(
+                f"Otari has no service key named {env.OTARI_OWNER_USER!r}; run scripts/otari_provision.py"
+            )
+            return
+        present = {budget["budget_id"] for budget in budgets}
+        assignable = set(key.get("end_user_budget_ids") or [])
         for service_type, config in env.service_type_config.items():
-            name = config["budget_id"]
-            found = budgets.get(name, [])
-            if len(found) != 1:
+            budget_id = config["budget_id"]
+            if budget_id not in present:
                 logger.error(
-                    f"Otari has {len(found)} budgets named {name!r} (service type {service_type}), "
-                    "expected 1; run scripts/otari_provision.py"
+                    f"Otari has no budget {budget_id!r} (service type {service_type}); "
+                    "run scripts/otari_provision.py"
                 )
-            if found:
-                self._learn_budget(name, found[0]["budget_id"])
-            if key_name_of(service_type) not in keys:
+            elif budget_id not in assignable:
                 logger.error(
-                    f"Otari has no service key for service type {service_type}; run scripts/otari_provision.py"
+                    f"MLPA's Otari key may not assign budget {budget_id!r} (service type {service_type}); "
+                    "run scripts/otari_provision.py"
                 )
