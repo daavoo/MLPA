@@ -64,17 +64,16 @@ def _build_litellm_body(req: AuthorizedChatRequest, *, stream: bool) -> dict:
         body["stream_options"] = {"include_usage": True}
     # tags would be litellm-native but spend-by-tag reporting is Enterprise-only
     # and tags are flat strings, harder to query in BQ. JSON metadata is OSS and
-    # queryable as a plain key.
-    if USE_OTARI:
-        # Otari has no spend metadata yet and serves no mock model; it would drop both.
-        body.pop("mock_response", None)
-    else:
-        body["metadata"] = {
-            "spend_logs_metadata": {
-                "purpose": req.purpose,
-                "country_code": req.client_country,
-            }
+    # queryable as a plain key. Otari reads the same field as its request tags.
+    body["metadata"] = {
+        "spend_logs_metadata": {
+            "purpose": req.purpose,
+            "country_code": req.client_country,
         }
+    }
+    if USE_OTARI:
+        # Otari serves no mock model.
+        body.pop("mock_response", None)
     return sanitize_request_body(body)
 
 

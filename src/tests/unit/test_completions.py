@@ -1820,6 +1820,27 @@ def test_build_litellm_body_includes_purpose_and_country_in_spend_logs_metadata(
     assert "client_country" not in body
 
 
+def test_build_litellm_body_sends_spend_logs_metadata_to_otari_too(monkeypatch):
+    """Otari records metadata.spend_logs_metadata as request tags, so the Otari
+    backend sends it exactly as the LiteLLM one does."""
+    monkeypatch.setattr("mlpa.core.completions.USE_OTARI", True)
+    req = AuthorizedChatRequest(
+        user="test-user-123:ai",
+        service_type="ai",
+        purpose="chat",
+        client_country="FR",
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=150,
+    )
+
+    body = _build_litellm_body(req, stream=False)
+
+    assert body["metadata"] == {
+        "spend_logs_metadata": {"purpose": "chat", "country_code": "FR"}
+    }
+
+
 def test_build_litellm_body_includes_empty_purpose_and_country_when_unset():
     """Service types with no configured purposes (e.g. s2s) carry purpose="",
     and requests with no edge-stamped geo header carry client_country="" -
