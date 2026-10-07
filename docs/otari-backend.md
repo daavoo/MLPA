@@ -43,5 +43,5 @@ GATEWAY_BACKEND=otari OTARI_API_BASE=... OTARI_MASTER_KEY=... \
   uv run python scripts/otari_provision.py [--rotate] [--env-file .env]
 ```
 
-A local stack (MLPA, Otari, fake providers) with end-to-end checks lives in Otari's pilot branch,
-under `pilot/`.
+A local stack (Firefox, MLPA, Otari on its `main` branch, fake providers) with end-to-end checks
+lives in [mozilla-ai/otari-firefox-pilot](https://github.com/mozilla-ai/otari-firefox-pilot).
