@@ -462,6 +462,15 @@ async def _get_completion(
             raise_and_log(e)
         litellm_routing_snapshot = parse_litellm_routing_headers(response.headers)
         data = sanitize_response_body(response.json())
+        if not data.get("choices"):
+            # A 200 with no choices carries no answer for the client (seen from Vertex AI
+            # through Otari), so it is an upstream failure, not a success.
+            logger.error(
+                f"Upstream returned no choices for model {authorized_chat_request.model}"
+            )
+            raise HTTPException(
+                status_code=502, detail={"error": "Upstream service returned an error"}
+            )
         usage = data.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
@@ -475,9 +484,7 @@ async def _get_completion(
                 f"Missing 'completion_tokens' in usage for model {authorized_chat_request.model}"
             )
 
-        tool_calls = (
-            data.get("choices", [{}])[0].get("message", {}).get("tool_calls") or []
-        )
+        tool_calls = data["choices"][0].get("message", {}).get("tool_calls") or []
         tool_names = extract_tool_names(tool_calls)
         record_completion_success(
             authorized_chat_request,

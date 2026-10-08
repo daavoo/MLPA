@@ -443,6 +443,34 @@ async def test_get_completion_network_error(mocker, metrics_spy):
     assert _latency_count(metrics_spy, PrometheusResult.ERROR) == 1
 
 
+async def test_get_completion_without_choices_is_an_upstream_error(mocker, metrics_spy):
+    """A 200 whose body has no choices is a 502, not a success with no answer."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        **SUCCESSFUL_CHAT_RESPONSE,
+        "choices": [],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+    }
+    mock_response.headers = _sample_litellm_response_headers()
+    mock_response.raise_for_status.return_value = None
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_completion(Request({"type": "http", "headers": []}), SAMPLE_REQUEST)
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == {"error": "Upstream service returned an error"}
+    metrics_spy.assert_only(
+        _expect_metrics(
+            "chat_completion_latency",
+            "chat_availability",
+        )
+    )
+    assert _latency_count(metrics_spy, PrometheusResult.ERROR) == 1
+
+
 async def test_stream_completion_success(
     httpx_mock: HTTPXMock, mock_request, metrics_spy
 ):
