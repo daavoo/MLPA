@@ -1,3 +1,5 @@
+from typing import cast
+
 from fastapi import HTTPException
 
 from mlpa.core.config import USE_OTARI, env
@@ -149,9 +151,10 @@ class AppAttestPGService(PGService):
         # Read the litellm pool before opening the app_attest transaction: doing
         # it inside would leave the session idle-in-transaction across the
         # cross-pool await, where idle_in_transaction_session_timeout could reap it.
-        base_identities = await self.litellm_pg.list_managed_base_identities(
-            managed_service_types
-        )
+        # Only LiteLLM gets here: under Otari the method returned above.
+        base_identities = await cast(
+            LiteLLMPGService, self.litellm_pg
+        ).list_managed_base_identities(managed_service_types)
 
         # The bulk delete + insert grows with the user base, so run it under the
         # raised maintenance budget rather than the tight pool default.
@@ -271,7 +274,10 @@ class AppAttestPGService(PGService):
         # Read the litellm state before opening the app_attest transaction (same
         # cross-pool idle-in-transaction risk as ensure_capacity_state); reaping
         # the session here would abort the release and leak the claim.
-        has_managed_user_rows = await self.litellm_pg.has_managed_user_rows(
+        # Only the LiteLLM path releases claims (utils.get_or_create_user).
+        has_managed_user_rows = await cast(
+            LiteLLMPGService, self.litellm_pg
+        ).has_managed_user_rows(
             base_identity,
             managed_service_types,
         )

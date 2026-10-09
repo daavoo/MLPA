@@ -99,7 +99,7 @@ def _parse_otari_routing_headers(headers: Mapping[str, str]) -> LitellmRoutingSn
 
 
 def with_usage_cost(
-    snapshot: LitellmRoutingSnapshot, usage: object
+    snapshot: LitellmRoutingSnapshot, usage: Mapping[str, object] | None
 ) -> LitellmRoutingSnapshot:
     """Fill the cost from Otari's usage.cost_usd when no header carried one."""
     if snapshot.response_cost_usd is not None or not isinstance(usage, dict):
