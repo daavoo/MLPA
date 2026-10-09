@@ -22,7 +22,7 @@ from mlpa.core.errors import (
     is_otari_user_blocked,
 )
 from mlpa.core.http_client import get_http_client
-from mlpa.core.litellm_routing import parse_litellm_routing_headers
+from mlpa.core.litellm_routing import parse_litellm_routing_headers, with_usage_cost
 from mlpa.core.logger import logger
 from mlpa.core.metrics import (
     extract_tool_names,
@@ -139,6 +139,7 @@ async def stream_completion(
     prompt_tokens = 0
     completion_tokens = 0
     streaming_started = False
+    stream_failed = False
     tool_calls_accum: dict[int, dict] = {}
     log.debug(
         f"Starting a stream completion using {authorized_chat_request.model}, for user {authorized_chat_request.user}",
@@ -190,6 +191,7 @@ async def stream_completion(
                         pass
 
                     if is_otari_user_blocked(e.response.headers):
+                        availability_reason = AvailabilityReason.BLOCKED
                         yield f"data: {json.dumps(USER_BLOCKED_DETAIL)}\n\n".encode()
                         return
                     match = classify_upstream_error(
@@ -278,6 +280,10 @@ async def stream_completion(
                                         data, authorized_chat_request.user
                                     )
                                 )
+                                # An error event MLPA has no code for (Otari's
+                                # provider_error) still ends the stream as a failure.
+                                if isinstance(data, dict) and data.get("error"):
+                                    stream_failed = True
                                 # OpenAI-shaped streams (Otari's among them) send
                                 # "usage": null on every chunk but the last.
                                 if data.get("usage"):
@@ -328,6 +334,12 @@ async def stream_completion(
                 if result == PrometheusResult.ABORT:
                     return
 
+                if stream_failed:
+                    log.warning(
+                        f"Upstream stream failed for model {authorized_chat_request.model}"
+                    )
+                    return
+
                 if not streaming_started:
                     availability_reason = AvailabilityReason.EMPTY_RESPONSE
                     yield raise_and_log(
@@ -347,7 +359,7 @@ async def stream_completion(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     tool_names=tool_names,
-                    snapshot=litellm_routing_snapshot,
+                    snapshot=with_usage_cost(litellm_routing_snapshot, usage),
                 )
                 result = PrometheusResult.SUCCESS
                 availability_reason = AvailabilityReason.VALID_RESPONSE
@@ -439,6 +451,7 @@ async def _get_completion(
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
             if is_otari_user_blocked(e.response.headers):
+                availability_reason = AvailabilityReason.BLOCKED
                 raise HTTPException(status_code=403, detail=USER_BLOCKED_DETAIL)
             match = classify_upstream_error(
                 error_text=e.response.text,
@@ -491,7 +504,7 @@ async def _get_completion(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             tool_names=tool_names,
-            snapshot=litellm_routing_snapshot,
+            snapshot=with_usage_cost(litellm_routing_snapshot, usage),
         )
         result = PrometheusResult.SUCCESS
         availability_reason = AvailabilityReason.VALID_RESPONSE

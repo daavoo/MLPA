@@ -10,6 +10,7 @@ from mlpa.core.config import (
     ERROR_CODE_BUDGET_LIMIT_EXCEEDED,
     ERROR_CODE_GLOBAL_BUDGET_LIMIT_EXCEEDED,
     ERROR_CODE_INVALID_MODEL_NAME,
+    ERROR_CODE_INVALID_REQUEST,
     ERROR_CODE_RATE_LIMIT_EXCEEDED,
     ERROR_CODE_REQUEST_TOO_LARGE,
     ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED,
@@ -58,6 +59,7 @@ def _classify(code: str, status: int = 429, **headers: str):
             429,
         ),
         ("invalid_model", None, 400, ERROR_CODE_INVALID_MODEL_NAME, 400),
+        ("invalid_request", None, 422, ERROR_CODE_INVALID_REQUEST, 400),
     ],
 )
 def test_otari_codes_map_without_reading_the_text(

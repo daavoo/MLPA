@@ -1,6 +1,6 @@
 from fastapi import HTTPException
 
-from mlpa.core.config import env
+from mlpa.core.config import USE_OTARI, env
 from mlpa.core.logger import logger
 from mlpa.core.services.litellm_pg_service import LiteLLMPGService
 from mlpa.core.services.otari_service import OtariService
@@ -139,6 +139,11 @@ class AppAttestPGService(PGService):
 
     async def _reconcile_capacity_claims(self) -> None:
         """Rebuild the claim table from LiteLLM and refresh current_identities."""
+        if USE_OTARI:
+            # Under Otari the claim table is the record of who was admitted: Otari
+            # creates an end user on its first request and MLPA never looks users up,
+            # so there is nothing to rebuild it from, and nothing to rebuild.
+            return
         managed_service_types = list(env.MLPA_CAPPED_SERVICE_TYPES)
 
         # Read the litellm pool before opening the app_attest transaction: doing
@@ -193,6 +198,14 @@ class AppAttestPGService(PGService):
           (admitted, newly_claimed)
         """
         if not env.MLPA_ENFORCE_SIGNIN_CAP:
+            return True, False
+
+        # Most requests come from identities already admitted: answer those without
+        # taking the capacity row's lock, which every new admission serializes on.
+        if await self.pool.fetchval(
+            "SELECT 1 FROM mlpa_user_capacity_identities WHERE base_identity = $1",
+            base_identity,
+        ):
             return True, False
 
         async with self.admission_transaction() as conn:

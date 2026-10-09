@@ -67,7 +67,10 @@ class Env(BaseSettings):
     # Otari's API rather than LiteLLM's tables.
     GATEWAY_BACKEND: Literal["litellm", "otari"] = "litellm"
     OTARI_API_BASE: str = "http://localhost:8000"
-    OTARI_MASTER_KEY: str = "sk-otari-default"
+    # Otari's master key, for MLPA's admin routes (block, unblock, budget moves, user
+    # lists) and the startup check of what provisioning wrote. Serving needs only
+    # OTARI_SERVICE_KEY; without a master key both of the above are unavailable.
+    OTARI_MASTER_KEY: str = ""
     # MLPA's Otari service key, written by scripts/otari_provision.py.
     OTARI_SERVICE_KEY: str = ""
     # The Otari user that owns the service key and every end user, and the key's name.
@@ -675,6 +678,11 @@ LITELLM_HEADER_ATTEMPTED_FALLBACKS = "x-litellm-attempted-fallbacks"
 LITELLM_HEADER_ATTEMPTED_RETRIES = "x-litellm-attempted-retries"
 LITELLM_HEADER_RESPONSE_DURATION_MS = "x-litellm-response-duration-ms"
 LITELLM_HEADER_RESPONSE_COST = "x-litellm-response-cost"
+# Otari's equivalents (Otari sends the cost in the body, as usage.cost_usd).
+OTARI_HEADER_PROVIDER = "otari-provider"
+OTARI_HEADER_ATTEMPT_COUNT = "otari-attempt-count"
+OTARI_HEADER_FALLBACK = "otari-fallback"
+OTARI_HEADER_RESPONSE_DURATION_MS = "otari-response-duration-ms"
 
 # Otari's stable refusal codes (Otari-Error-Code), and the headers beside them.
 OTARI_HEADER_ERROR_CODE = "otari-error-code"

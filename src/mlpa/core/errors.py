@@ -176,6 +176,13 @@ def _classify_otari_error(
             http_status=400,
             log_message=f"Invalid model name for user {user}: {error_text}",
         )
+    if error_code == "invalid_request":
+        return RejectionMatch(
+            reason=PrometheusRejectionReason.INVALID_REQUEST,
+            error_code=ERROR_CODE_INVALID_REQUEST,
+            http_status=400,
+            log_message=f"Invalid request for user {user}: {error_text}",
+        )
     return None
 
 

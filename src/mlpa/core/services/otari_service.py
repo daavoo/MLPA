@@ -211,44 +211,6 @@ class OtariService:
         counts = {st: count for st, count in counts.items() if count}
         return {"service_type_counts": counts, "total_users": sum(counts.values())}
 
-    async def list_managed_base_identities(
-        self, managed_service_types: list[str]
-    ) -> list[str]:
-        managed = set(managed_service_types)
-        identities: set[str] = set()
-        skip = 0
-        while True:
-            page = await self._request(
-                "GET",
-                "/users",
-                params={
-                    "parent_user_id": env.OTARI_OWNER_USER,
-                    "skip": skip,
-                    "limit": _PAGE,
-                },
-            )
-            for user in page:
-                base, _sep, service_type = (user.get("external_id") or "").partition(
-                    ":"
-                )
-                if service_type in managed:
-                    identities.add(base)
-            if len(page) < _PAGE:
-                break
-            skip += _PAGE
-        identities.discard("")
-        return sorted(identities)
-
-    async def has_managed_user_rows(
-        self, base_identity: str, managed_service_types: list[str]
-    ) -> bool:
-        for service_type in managed_service_types:
-            if await self._end_user("GET", f"{base_identity}:{service_type}"):
-                return True
-        return False
-
-    # Budgets and the key
-
     async def _service_key(self) -> dict[str, Any] | None:
         keys = await self._request("GET", "/keys", params={"limit": _PAGE})
         for key in keys:
@@ -360,6 +322,11 @@ class OtariService:
         Called at startup in place of the LiteLLM budget upsert, and read-only:
         scripts/otari_provision.py is what writes budgets and the key.
         """
+        if not env.OTARI_MASTER_KEY:
+            logger.info(
+                "No OTARI_MASTER_KEY: skipping the startup check of MLPA's budgets and key in Otari"
+            )
+            return
         try:
             key = await self._learn_key()
             budgets = await self._request("GET", "/budgets", params={"limit": _PAGE})

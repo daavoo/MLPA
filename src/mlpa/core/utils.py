@@ -211,33 +211,27 @@ async def get_or_create_user(user_id: str):
 async def _get_or_admit_otari_user(
     user_id: str, base_identity: str, service_type: str
 ) -> list:
-    """The Otari end user for ``user_id``, admitting a new one under the signup cap.
+    """Admit ``user_id`` under the signup cap; Otari itself needs nothing beforehand.
 
-    Otari creates an end user on its first request, so a new user is only
-    admitted here. Blocking is enforced by Otari on the request itself.
+    Otari creates an end user on its first request and enforces blocking, budgets
+    and limits on every request, so MLPA does not look users up in Otari. The
+    signup cap's claim table, in MLPA's own database, records who was admitted.
     """
     otari = cast(OtariService, litellm_pg)
     if otari.is_known(user_id):
         return [{"user_id": user_id, "blocked": False}, False]
-    try:
-        user = await otari.get_user(user_id)
-    except Exception as e:
-        logger.error(f"Error fetching Otari user {user_id}: {e}")
-        raise HTTPException(
-            status_code=500, detail={"error": "Error fetching user info"}
-        )
-    if user is not None:
-        return [user, False]
     if env.MLPA_ENFORCE_SIGNIN_CAP and service_type in env.MLPA_CAPPED_SERVICE_TYPES:
-        admitted, _newly_claimed = await app_attest_pg.admit_managed_base_identity(
+        admitted, newly_claimed = await app_attest_pg.admit_managed_base_identity(
             base_identity=base_identity
         )
         if not admitted:
             raise HTTPException(
                 status_code=403, detail={"error": ERROR_CODE_MAX_USERS_REACHED}
             )
+    else:
+        newly_claimed = False
     otari.remember(user_id)
-    return [{"user_id": user_id, "blocked": False}, True]
+    return [{"user_id": user_id, "blocked": False}, newly_claimed]
 
 
 def b64decode_safe(data_b64: str, obj_name: str = "object") -> bytes:
