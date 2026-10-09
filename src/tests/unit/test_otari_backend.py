@@ -22,7 +22,11 @@ from mlpa.core.errors import (
     classify_upstream_error,
     is_otari_user_blocked,
 )
-from mlpa.core.services.otari_service import OtariService, duration_seconds
+from mlpa.core.services.otari_service import (
+    OtariService,
+    budget_period,
+    duration_seconds,
+)
 
 
 def _classify(code: str, status: int = 429, **headers: str):
@@ -219,7 +223,7 @@ async def test_provisioning_puts_budgets_by_id_and_one_key_listing_them(
     assert json.loads(put.content) == {
         "name": "end-user-budget-ai",
         "max_budget": 0.1,
-        "budget_duration_sec": 86400,
+        "reset_alignment": "calendar_day",
         "rpm_limit": 40,
         "tpm_limit": 2000,
     }
@@ -248,6 +252,93 @@ async def test_provisioning_again_leaves_a_matching_key_alone(
 
     assert await otari.provision() is None
     assert {r.method for r in httpx_mock.get_requests()} == {"PUT", "GET"}
+
+
+@pytest.mark.parametrize(
+    ("duration", "period"),
+    [
+        ("1d", {"reset_alignment": "calendar_day"}),
+        ("7d", {"reset_alignment": "calendar_week"}),
+        ("1mo", {"reset_alignment": "calendar_month"}),
+        ("30m", {"budget_duration_sec": 1800}),
+        ("2d", {"budget_duration_sec": 172800}),
+    ],
+)
+def test_budget_period_resets_whole_days_weeks_and_months_at_utc_boundaries(
+    duration, period
+):
+    assert budget_period(duration) == period
+
+
+async def test_provisioning_caps_the_key_at_the_global_budget(
+    otari, httpx_mock, ai_only, monkeypatch
+):
+    monkeypatch.setattr(env, "OTARI_GLOBAL_MAX_BUDGET", 250.0)
+    httpx_mock.add_response(
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/end-user-budget-ai",
+        json={"budget_id": "end-user-budget-ai"},
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
+    )
+    httpx_mock.add_response(
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/mlpa-global",
+        json={"budget_id": "mlpa-global"},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/scoped-budgets?scope_type=api_token&scope_id=k1",
+        json=[],
+    )
+    httpx_mock.add_response(
+        method="POST", url=f"{OTARI_API_ROOT}/scoped-budgets", json={"id": "c1"}
+    )
+
+    assert await otari.provision() is None
+
+    requests = httpx_mock.get_requests()
+    global_budget = next(r for r in requests if r.url.path.endswith("/mlpa-global"))
+    assert json.loads(global_budget.content) == {
+        "name": "mlpa-global",
+        "max_budget": 250.0,
+        "reset_alignment": "calendar_day",
+    }
+    ceiling = next(r for r in requests if r.method == "POST")
+    assert json.loads(ceiling.content) == {
+        "scope_type": "api_token",
+        "scope_id": "k1",
+        "budget_id": "mlpa-global",
+        "name": "MLPA global budget",
+    }
+
+
+async def test_provisioning_again_keeps_the_existing_global_ceiling(
+    otari, httpx_mock, ai_only, monkeypatch
+):
+    monkeypatch.setattr(env, "OTARI_GLOBAL_MAX_BUDGET", 250.0)
+    httpx_mock.add_response(
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/end-user-budget-ai",
+        json={"budget_id": "end-user-budget-ai"},
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
+    )
+    httpx_mock.add_response(
+        method="PUT",
+        url=f"{OTARI_API_ROOT}/budgets/mlpa-global",
+        json={"budget_id": "mlpa-global"},
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{OTARI_API_ROOT}/scoped-budgets?scope_type=api_token&scope_id=k1",
+        json=[{"id": "c1", "budget_id": "mlpa-global"}],
+    )
+
+    assert await otari.provision() is None
+    assert "POST" not in {r.method for r in httpx_mock.get_requests()}
 
 
 async def test_startup_only_reads(otari, httpx_mock, ai_only):

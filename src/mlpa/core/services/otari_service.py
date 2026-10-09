@@ -45,6 +45,25 @@ def duration_seconds(duration: str) -> int:
     return int(match.group(1)) * _DURATION_SECONDS[match.group(2)]
 
 
+# A whole number of days, weeks or months resets on that UTC calendar boundary, as
+# MLPA's budgets are meant to; any other duration keeps a rolling period.
+_CALENDAR_ALIGNMENT = {
+    "1d": "calendar_day",
+    "1w": "calendar_week",
+    "7d": "calendar_week",
+    "1mo": "calendar_month",
+    "30d": "calendar_month",
+}
+
+
+def budget_period(duration: str) -> dict[str, str | int]:
+    """The Otari budget fields for a LiteLLM budget duration: a UTC calendar reset where one matches."""
+    alignment = _CALENDAR_ALIGNMENT.get(duration.replace(" ", ""))
+    if alignment is not None:
+        return {"reset_alignment": alignment}
+    return {"budget_duration_sec": duration_seconds(duration)}
+
+
 def budget_ids() -> list[str]:
     """MLPA's budget ids, one per service type, in service-type order and without repeats."""
     return list(dict.fromkeys(c["budget_id"] for c in env.service_type_config.values()))
@@ -260,7 +279,7 @@ class OtariService:
                 json={
                     "name": config["budget_id"],
                     "max_budget": config["max_budget"],
-                    "budget_duration_sec": duration_seconds(config["budget_duration"]),
+                    **budget_period(config["budget_duration"]),
                     # Per user per minute; tokens are counted on what requests used, as LiteLLM does.
                     "rpm_limit": config["rpm_limit"],
                     "tpm_limit": config["tpm_limit"],
@@ -274,6 +293,7 @@ class OtariService:
         # MLPA names a budget on every request, so the default only catches a
         # request that somehow names none: it is the first service type's.
         assignment = {"end_user_budget_ids": listed, "end_user_budget_id": listed[0]}
+        secret: str | None = None
         key = await self._learn_key()
         if key is None:
             created = await self._request(
@@ -286,17 +306,53 @@ class OtariService:
                     **assignment,
                 },
             )
-            self._key_id = created["id"]
-            return created["key"]
-        if (
-            key.get("end_user_budget_ids") != listed
-            or key.get("end_user_budget_id") != listed[0]
-        ):
-            await self._request("PATCH", f"/keys/{key['id']}", json=assignment)
-        if rotate:
-            rotated = await self._request("POST", f"/keys/{key['id']}/rotate")
-            return rotated["key"]
-        return None
+            self._key_id = key_id = created["id"]
+            secret = created["key"]
+        else:
+            key_id = key["id"]
+            if (
+                key.get("end_user_budget_ids") != listed
+                or key.get("end_user_budget_id") != listed[0]
+            ):
+                await self._request("PATCH", f"/keys/{key_id}", json=assignment)
+            if rotate:
+                rotated = await self._request("POST", f"/keys/{key_id}/rotate")
+                secret = rotated["key"]
+        if env.OTARI_GLOBAL_MAX_BUDGET is not None:
+            await self._provision_global_budget(key_id)
+        return secret
+
+    async def _provision_global_budget(self, key_id: str) -> None:
+        """Cap MLPA's service key, and so every end user behind it, at the global budget."""
+        budget_id = env.OTARI_GLOBAL_BUDGET_ID
+        await self._request(
+            "PUT",
+            f"/budgets/{budget_id}",
+            json={
+                "name": budget_id,
+                "max_budget": env.OTARI_GLOBAL_MAX_BUDGET,
+                "reset_alignment": "calendar_day",
+            },
+        )
+        ceilings = await self._request(
+            "GET",
+            "/scoped-budgets",
+            params={"scope_type": "api_token", "scope_id": key_id},
+        )
+        if not any(c["budget_id"] == budget_id for c in ceilings):
+            await self._request(
+                "POST",
+                "/scoped-budgets",
+                json={
+                    "scope_type": "api_token",
+                    "scope_id": key_id,
+                    "budget_id": budget_id,
+                    "name": "MLPA global budget",
+                },
+            )
+        logger.info(
+            f"Global budget provisioned: budget_id={budget_id}, key_id={key_id}"
+        )
 
     async def create_budget(self) -> None:
         """Learn the service key's id, and say what provisioning has not done.

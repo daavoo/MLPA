@@ -72,6 +72,10 @@ class Env(BaseSettings):
     OTARI_SERVICE_KEY: str = ""
     # The Otari user that owns the service key and every end user, and the key's name.
     OTARI_OWNER_USER: str = "mlpa"
+    # The global budget (error code 10): a ceiling in USD on MLPA's service key that
+    # pools every end user, reset at UTC midnight. Unset leaves the key uncapped.
+    OTARI_GLOBAL_MAX_BUDGET: float | None = None
+    OTARI_GLOBAL_BUDGET_ID: str = "mlpa-global"
     # End users known to exist in Otari, remembered so the signup cap is checked
     # without a lookup on every request.
     OTARI_KNOWN_USERS_CACHE_SIZE: int = 100_000
