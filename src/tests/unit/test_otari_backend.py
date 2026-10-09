@@ -343,7 +343,8 @@ async def test_provisioning_again_keeps_the_existing_global_ceiling(
     assert "POST" not in {r.method for r in httpx_mock.get_requests()}
 
 
-async def test_startup_only_reads(otari, httpx_mock, ai_only):
+async def test_startup_only_reads(otari, httpx_mock, ai_only, monkeypatch):
+    monkeypatch.setattr(env, "OTARI_MASTER_KEY", "sk-otari-master")
     httpx_mock.add_response(
         method="GET", url=f"{OTARI_API_ROOT}/keys?limit=1000", json=[_KEY]
     )
@@ -357,6 +358,16 @@ async def test_startup_only_reads(otari, httpx_mock, ai_only):
 
     assert {r.method for r in httpx_mock.get_requests()} == {"GET"}
     assert otari._key_id == "k1"
+
+
+async def test_startup_check_is_skipped_without_a_master_key(
+    otari, httpx_mock, ai_only, monkeypatch
+):
+    monkeypatch.setattr(env, "OTARI_MASTER_KEY", "")
+
+    await otari.create_budget()
+
+    assert httpx_mock.get_requests() == []
 
 
 async def test_users_are_counted_by_their_service_types_budget(
