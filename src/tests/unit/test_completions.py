@@ -443,6 +443,34 @@ async def test_get_completion_network_error(mocker, metrics_spy):
     assert _latency_count(metrics_spy, PrometheusResult.ERROR) == 1
 
 
+async def test_get_completion_without_choices_is_an_upstream_error(mocker, metrics_spy):
+    """A 200 whose body has no choices is a 502, not a success with no answer."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        **SUCCESSFUL_CHAT_RESPONSE,
+        "choices": [],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+    }
+    mock_response.headers = _sample_litellm_response_headers()
+    mock_response.raise_for_status.return_value = None
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_completion(Request({"type": "http", "headers": []}), SAMPLE_REQUEST)
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == {"error": "Upstream service returned an error"}
+    metrics_spy.assert_only(
+        _expect_metrics(
+            "chat_completion_latency",
+            "chat_availability",
+        )
+    )
+    assert _latency_count(metrics_spy, PrometheusResult.ERROR) == 1
+
+
 async def test_stream_completion_success(
     httpx_mock: HTTPXMock, mock_request, metrics_spy
 ):
@@ -537,6 +565,35 @@ async def test_stream_completion_success(
         if s.labels.get("fallback_used") == "false"
     }
     assert routed_token_types == {"prompt", "completion"}
+
+
+async def test_stream_completion_reads_openai_shaped_chunks(
+    httpx_mock: HTTPXMock, mock_request, metrics_spy
+):
+    """An OpenAI-shaped stream sends "usage": null on content chunks and "choices": [] with usage."""
+    mock_chunks = [
+        b'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}], "usage": null}\n\n',
+        b'data: {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 25}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    httpx_mock.add_response(
+        method="POST",
+        url=LITELLM_COMPLETIONS_URL,
+        stream=IteratorStream(mock_chunks),
+        status_code=200,
+    )
+
+    received_chunks = [
+        chunk async for chunk in stream_completion(mock_request, SAMPLE_REQUEST)
+    ]
+
+    assert received_chunks == mock_chunks
+    chat_label_base = {
+        "model": SAMPLE_REQUEST.model,
+        "service_type": SAMPLE_REQUEST.service_type,
+        "purpose": SAMPLE_REQUEST.purpose,
+    }
+    assert metrics_spy.value("chat_tokens", type="completion", **chat_label_base) == 25
 
 
 async def test_stream_completion_litellm_routing_with_fallback(
@@ -1789,6 +1846,27 @@ def test_build_litellm_body_includes_purpose_and_country_in_spend_logs_metadata(
     assert "purpose" not in body
     assert "service_type" not in body
     assert "client_country" not in body
+
+
+def test_build_litellm_body_sends_spend_logs_metadata_to_otari_too(monkeypatch):
+    """Otari records metadata.spend_logs_metadata as request tags, so the Otari
+    backend sends it exactly as the LiteLLM one does."""
+    monkeypatch.setattr("mlpa.core.completions.USE_OTARI", True)
+    req = AuthorizedChatRequest(
+        user="test-user-123:ai",
+        service_type="ai",
+        purpose="chat",
+        client_country="FR",
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=150,
+    )
+
+    body = _build_litellm_body(req, stream=False)
+
+    assert body["metadata"] == {
+        "spend_logs_metadata": {"purpose": "chat", "country_code": "FR"}
+    }
 
 
 def test_build_litellm_body_includes_empty_purpose_and_country_when_unset():

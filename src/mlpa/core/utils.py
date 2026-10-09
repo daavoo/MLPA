@@ -15,12 +15,14 @@ from mlpa.core.classes import AssertionAuth, AttestationAuth
 from mlpa.core.config import (
     ERROR_CODE_MAX_USERS_REACHED,
     LITELLM_MASTER_AUTH_HEADERS,
+    USE_OTARI,
     env,
 )
 from mlpa.core.consts.country_codes import COUNTRY_CODES
 from mlpa.core.http_client import get_http_client
 from mlpa.core.logger import logger
 from mlpa.core.prometheus_metrics import PrometheusResult, metrics
+from mlpa.core.services.otari_service import OtariService
 from mlpa.core.services.services import app_attest_pg, litellm_pg
 
 KNOWN_HTTP_METHODS = frozenset(
@@ -142,6 +144,8 @@ async def get_or_create_user(user_id: str):
 
     client = get_http_client()
     claimed_new_identity = False
+    if USE_OTARI:
+        return await _get_or_admit_otari_user(user_id, base_identity, service_type)
     try:
         db_user = await litellm_pg.get_user(user_id)
 
@@ -202,6 +206,32 @@ async def get_or_create_user(user_id: str):
         raise HTTPException(
             status_code=500, detail={"error": f"Error fetching user info"}
         )
+
+
+async def _get_or_admit_otari_user(
+    user_id: str, base_identity: str, service_type: str
+) -> list:
+    """Admit ``user_id`` under the signup cap; Otari itself needs nothing beforehand.
+
+    Otari creates an end user on its first request and enforces blocking, budgets
+    and limits on every request, so MLPA does not look users up in Otari. The
+    signup cap's claim table, in MLPA's own database, records who was admitted.
+    """
+    otari = cast(OtariService, litellm_pg)
+    if otari.is_known(user_id):
+        return [{"user_id": user_id, "blocked": False}, False]
+    if env.MLPA_ENFORCE_SIGNIN_CAP and service_type in env.MLPA_CAPPED_SERVICE_TYPES:
+        admitted, newly_claimed = await app_attest_pg.admit_managed_base_identity(
+            base_identity=base_identity
+        )
+        if not admitted:
+            raise HTTPException(
+                status_code=403, detail={"error": ERROR_CODE_MAX_USERS_REACHED}
+            )
+    else:
+        newly_claimed = False
+    otari.remember(user_id)
+    return [{"user_id": user_id, "blocked": False}, newly_claimed]
 
 
 def b64decode_safe(data_b64: str, obj_name: str = "object") -> bytes:

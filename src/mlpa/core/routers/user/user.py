@@ -9,6 +9,7 @@ from mlpa.core.config import (
     ADMIN_UNAUTHORIZED_RESPONSE,
     LITELLM_MASTER_AUTH_HEADERS,
     UNKNOWN_SERVICE_TYPE_RESPONSE,
+    USE_OTARI,
     USER_NOT_FOUND_RESPONSE,
     env,
 )
@@ -86,6 +87,12 @@ async def signup_cap_status(
 async def user_info(user_id: str):
     if not user_id or user_id.strip() == "":
         raise HTTPException(status_code=404, detail="User not found")
+
+    if USE_OTARI:
+        user = await litellm_pg.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
 
     client = get_http_client()
     params = {"end_user_id": user_id}
