@@ -22,6 +22,10 @@ TAGS_METADATA = [
         "name": "Play Integrity",
         "description": "Endpoints for verifying Play Integrity payloads.",
     },
+    {
+        "name": "Guest",
+        "description": "Guest tokens for Smart Window users without an account.",
+    },
     {"name": "LiteLLM", "description": "Endpoints for interacting with LiteLLM."},
     {"name": "Mock", "description": "Mock endpoints for testing purposes."},
     {
@@ -113,13 +117,13 @@ def customize_openapi(app: FastAPI, tags_metadata: list[dict]) -> None:
             params = post_chat.setdefault("parameters", [])
             chat_service_types = [
                 st
-                for st in env.valid_service_types
+                for st in env.client_service_types
                 if st not in SEARCH_SERVICE_TYPES_SET
             ]
             purpose_required = (
                 [
                     st
-                    for st in env.valid_service_types
+                    for st in env.client_service_types
                     if env.service_type_requires_purpose(st) and "search" not in st
                 ]
                 if env.MLPA_REQUIRE_PURPOSE_HEADER

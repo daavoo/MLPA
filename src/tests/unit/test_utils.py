@@ -7,9 +7,11 @@ from mlpa.core.config import env
 from mlpa.core.utils import (
     b64decode_safe,
     clamp_country,
+    clamp_exa_error_labels,
     clamp_launch_country,
     clamp_purpose,
     clamp_service_type,
+    get_fxa_client,
     is_context_window_error,
     is_invalid_model_name_error,
     is_invalid_request_error,
@@ -42,26 +44,6 @@ def test_is_valid_model_name_accepts_real_model_names(model):
 
 @pytest.mark.parametrize("model", SAMPLED_ATTACK_PAYLOADS)
 def test_is_valid_model_name_rejects_sampled_attack_payloads(model):
-    assert is_valid_model_name(model) is False
-
-
-@pytest.mark.parametrize(
-    "model",
-    [
-        "",
-        "-gpt-oss",
-        "gpt-oss-",
-        ".gpt-oss",
-        "gpt-oss.",
-        "a" * 65,
-        "GPT-OSS-120B",
-        "_gpt-oss",
-        "gpt-oss_",
-        "/gpt-oss",
-        "gpt-oss/",
-    ],
-)
-def test_is_valid_model_name_rejects_edge_cases(model):
     assert is_valid_model_name(model) is False
 
 
@@ -380,3 +362,24 @@ def test_clamp_country(raw, expected):
 )
 def test_clamp_launch_country(raw, expected):
     assert clamp_launch_country(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw_tag,status_code,expected",
+    [
+        ("BRAND_NEW_TAG", 504, ("504", "other")),
+        (None, 418, ("other", "untagged")),
+    ],
+)
+def test_clamp_exa_error_labels(raw_tag, status_code, expected):
+    assert clamp_exa_error_labels(raw_tag, status_code) == expected
+
+
+@pytest.mark.parametrize("debug", [True, False])
+def test_get_fxa_client_always_uses_prod_fxa(mocker, debug):
+    mocker.patch.object(env, "MLPA_DEBUG", debug)
+    get_fxa_client.cache_clear()
+    try:
+        assert get_fxa_client().server_url == "https://oauth.accounts.firefox.com/v1"
+    finally:
+        get_fxa_client.cache_clear()

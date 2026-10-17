@@ -9,10 +9,20 @@ from mlpa.core.config import (
     LITELLM_SEARCH_URL,
     resolve_litellm_virtual_auth_headers,
 )
-from mlpa.core.errors import classify_upstream_error
+from mlpa.core.errors import (
+    USER_BLOCKED_DETAIL,
+    classify_upstream_error,
+    is_otari_user_blocked,
+)
 from mlpa.core.http_client import get_http_client
 from mlpa.core.logger import logger
-from mlpa.core.metrics import record_search_latency, record_search_request_rejection
+from mlpa.core.metrics import (
+    SEARCH_ENDPOINT,
+    SEARCH_MODEL,
+    record_exa_error,
+    record_search_latency,
+    record_search_request_rejection,
+)
 from mlpa.core.prometheus_metrics import PrometheusResult
 from mlpa.core.request_timings import measure
 from mlpa.core.sanitization import sanitize_request_body, sanitize_response_body
@@ -32,17 +42,18 @@ async def _get_search(
     request: Request, authorized_search_request: AuthorizedSearchRequest
 ):
     start_time = time.perf_counter()
-    body = sanitize_request_body(
-        authorized_search_request.model_dump(
-            exclude={
-                "client_country",
-                "service_type",
-                "purpose",
-                "litellm_virtual_key",
-            },
-            exclude_none=True,
+    with measure("request_preparation", request):
+        body = sanitize_request_body(
+            authorized_search_request.model_dump(
+                exclude={
+                    "client_country",
+                    "service_type",
+                    "purpose",
+                    "litellm_virtual_key",
+                },
+                exclude_none=True,
+            )
         )
-    )
     result = PrometheusResult.ERROR
     usage = None
     logger.debug(
@@ -54,17 +65,29 @@ async def _get_search(
             response = await client.post(
                 f"{LITELLM_SEARCH_URL}/exa-search",
                 headers=resolve_litellm_virtual_auth_headers(
-                    authorized_search_request.litellm_virtual_key
+                    authorized_search_request.litellm_virtual_key,
+                    authorized_search_request.service_type,
                 ),
                 json=body,
             )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if is_otari_user_blocked(e.response.headers):
+                raise HTTPException(status_code=403, detail=USER_BLOCKED_DETAIL)
             match = classify_upstream_error(
                 error_text=e.response.text,
                 status_code=e.response.status_code,
                 user=authorized_search_request.user,
+                headers=e.response.headers,
+            )
+            record_exa_error(
+                endpoint=SEARCH_ENDPOINT,
+                model=SEARCH_MODEL,
+                status_code=e.response.status_code,
+                error_text=e.response.text,
+                rejected=match is not None,
+                headers=e.response.headers,
             )
             if match is not None:
                 if match.log_message:

@@ -13,14 +13,19 @@ from jwtoxide import DecodingKey, ValidationOptions, decode, encode
 
 from mlpa.core.classes import AssertionAuth, AttestationAuth
 from mlpa.core.config import (
+    ERROR_CODE_MAX_GUESTS_REACHED,
     ERROR_CODE_MAX_USERS_REACHED,
+    GUEST_CAPACITY_ID,
     LITELLM_MASTER_AUTH_HEADERS,
+    USE_OTARI,
+    capacity_id_for_service_type,
     env,
 )
 from mlpa.core.consts.country_codes import COUNTRY_CODES
 from mlpa.core.http_client import get_http_client
 from mlpa.core.logger import logger
 from mlpa.core.prometheus_metrics import PrometheusResult, metrics
+from mlpa.core.services.otari_service import OtariService
 from mlpa.core.services.services import app_attest_pg, litellm_pg
 
 KNOWN_HTTP_METHODS = frozenset(
@@ -120,6 +125,60 @@ def clamp_launch_country(raw: str) -> str:
     return _clamp_to_set(raw, env.MLPA_LAUNCH_COUNTRIES, "other")
 
 
+# Request-level error tags from https://exa.ai/docs/reference/error-codes,
+# mapped to the HTTP status Exa returns with them.
+EXA_ERROR_TAG_STATUS: dict[str, str] = {
+    "INVALID_REQUEST_BODY": "400",
+    "INVALID_REQUEST": "400",
+    "INVALID_NUM_RESULTS": "400",
+    "NUM_RESULTS_EXCEEDED": "400",
+    "INVALID_JSON_SCHEMA": "400",
+    "SUBPAGES_LIMIT_EXCEEDED": "400",
+    "INVALID_API_KEY": "401",
+    "NO_MORE_CREDITS": "402",
+    "API_KEY_BUDGET_EXCEEDED": "402",
+    "TEAM_BUDGET_EXCEEDED": "402",
+    "FEATURE_DISABLED": "403",
+    "PROHIBITED_CONTENT": "403",
+    "CONTENT_FILTER_ERROR": "403",
+    "RATE_LIMIT_EXCEEDED": "429",
+    "SERVICE_OVERLOADED": "503",
+}
+EXA_ERROR_STATUS_CODES = frozenset(
+    {"400", "401", "402", "403", "404", "409", "422", "429", "500", "503", "504"}
+)
+EXA_ERROR_TAG_OTHER = "other"
+EXA_ERROR_TAG_UNTAGGED = "untagged"
+# Quotes may be JSON-escaped (\"tag\") or Python-repr style ('tag').
+_EXA_ERROR_TAG_PATTERN = re.compile(
+    r"""\\*["']tag\\*["']\s*:\s*\\*["']([A-Za-z0-9_]{1,64})\\*["']"""
+)
+
+
+def extract_exa_error_tag(error_text: str) -> str | None:
+    """Raw Exa error ``tag`` embedded in an upstream error body, if any.
+
+    LiteLLM wraps Exa errors as a string inside its own error JSON (and with
+    its own status code, e.g. 500 for an Exa 503), so the tag is matched
+    anywhere in the text rather than parsed from the top-level body.
+    """
+    match = _EXA_ERROR_TAG_PATTERN.search(error_text)
+    return match.group(1) if match else None
+
+
+def clamp_exa_error_labels(raw_tag: str | None, status_code: int) -> tuple[str, str]:
+    """Bound an Exa error to ``(status_code, tag)`` labels.
+
+    A documented tag carries Exa's own status. Otherwise the observed status
+    is clamped to Exa's documented codes, and the tag to "other" (unknown tag)
+    or "untagged" (no Exa body found).
+    """
+    if raw_tag is not None and raw_tag in EXA_ERROR_TAG_STATUS:
+        return EXA_ERROR_TAG_STATUS[raw_tag], raw_tag
+    status = _clamp_to_set(str(status_code), EXA_ERROR_STATUS_CODES, "other")
+    return status, EXA_ERROR_TAG_OTHER if raw_tag else EXA_ERROR_TAG_UNTAGGED
+
+
 def clamp_request_method(method: str) -> str:
     normalized = method.upper()
     return normalized if normalized in KNOWN_HTTP_METHODS else "INVALID"
@@ -141,28 +200,34 @@ async def get_or_create_user(user_id: str):
     budget_id = user_feature_budgets[service_type]["budget_id"]
 
     client = get_http_client()
-    claimed_new_identity = False
+    capacity_id = capacity_id_for_service_type(service_type)
+    if USE_OTARI:
+        return await _get_or_admit_otari_user(user_id, base_identity, capacity_id)
+    # Capacity row we claimed a new slot in, released if user creation fails.
+    claimed_capacity_id: int | None = None
     try:
         db_user = await litellm_pg.get_user(user_id)
 
         if db_user is None:
-            # Enforce managed service types user capacity with DB-backed admission control.
-            if (
-                env.MLPA_ENFORCE_SIGNIN_CAP
-                and service_type in env.MLPA_CAPPED_SERVICE_TYPES
-            ):
+            # Enforce user or guest capacity with DB-backed admission control.
+            if capacity_id is not None:
                 (
                     admitted,
                     newly_claimed,
                 ) = await app_attest_pg.admit_managed_base_identity(
-                    base_identity=base_identity
+                    base_identity=base_identity, capacity_id=capacity_id
                 )
                 if not admitted:
                     raise HTTPException(
                         status_code=403,
-                        detail={"error": ERROR_CODE_MAX_USERS_REACHED},
+                        detail={
+                            "error": ERROR_CODE_MAX_GUESTS_REACHED
+                            if capacity_id == GUEST_CAPACITY_ID
+                            else ERROR_CODE_MAX_USERS_REACHED
+                        },
                     )
-                claimed_new_identity = newly_claimed
+                if newly_claimed:
+                    claimed_capacity_id = capacity_id
 
             await client.post(
                 f"{env.LITELLM_API_BASE}/customer/new",
@@ -174,9 +239,9 @@ async def get_or_create_user(user_id: str):
             if created_user is None:
                 # Admission may have succeeded but LiteLLM user creation did not.
                 # Release the reserved slot to avoid claim/cap drift.
-                if claimed_new_identity:
+                if claimed_capacity_id is not None:
                     await app_attest_pg.maybe_release_managed_base_identity_if_no_managed_users(
-                        base_identity=base_identity
+                        base_identity=base_identity, capacity_id=claimed_capacity_id
                     )
                 raise HTTPException(
                     status_code=500,
@@ -189,10 +254,10 @@ async def get_or_create_user(user_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        if claimed_new_identity:
+        if claimed_capacity_id is not None:
             try:
                 await app_attest_pg.maybe_release_managed_base_identity_if_no_managed_users(
-                    base_identity=base_identity
+                    base_identity=base_identity, capacity_id=claimed_capacity_id
                 )
             except Exception as release_e:
                 logger.error(
@@ -202,6 +267,36 @@ async def get_or_create_user(user_id: str):
         raise HTTPException(
             status_code=500, detail={"error": f"Error fetching user info"}
         )
+
+
+async def _get_or_admit_otari_user(
+    user_id: str, base_identity: str, capacity_id: int | None
+) -> list:
+    """Admit ``user_id`` under the signup or guest cap; Otari itself needs nothing beforehand.
+
+    Otari creates an end user on its first request and enforces blocking, budgets
+    and limits on every request, so MLPA does not look users up in Otari. The
+    caps' claim table, in MLPA's own database, records who was admitted.
+    """
+    otari = cast(OtariService, litellm_pg)
+    if otari.is_known(user_id):
+        return [{"user_id": user_id, "blocked": False}, False]
+    newly_claimed = False
+    if capacity_id is not None:
+        admitted, newly_claimed = await app_attest_pg.admit_managed_base_identity(
+            base_identity=base_identity, capacity_id=capacity_id
+        )
+        if not admitted:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": ERROR_CODE_MAX_GUESTS_REACHED
+                    if capacity_id == GUEST_CAPACITY_ID
+                    else ERROR_CODE_MAX_USERS_REACHED
+                },
+            )
+    otari.remember(user_id)
+    return [{"user_id": user_id, "blocked": False}, newly_claimed]
 
 
 def b64decode_safe(data_b64: str, obj_name: str = "object") -> bytes:
@@ -214,12 +309,9 @@ def b64decode_safe(data_b64: str, obj_name: str = "object") -> bytes:
 
 @lru_cache(maxsize=1)
 def get_fxa_client():
-    fxa_url = (
-        "https://api-accounts.stage.mozaws.net/v1"
-        if env.MLPA_DEBUG
-        else "https://oauth.accounts.firefox.com/v1"
+    return Client(
+        env.CLIENT_ID, env.CLIENT_SECRET, "https://oauth.accounts.firefox.com/v1"
     )
-    return Client(env.CLIENT_ID, env.CLIENT_SECRET, fxa_url)
 
 
 def is_rate_limit_error(error_response: dict, keywords: list[str]) -> bool:

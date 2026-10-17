@@ -14,12 +14,15 @@ from mlpa.core.classes import (
     SearchRequest,
     ServiceType,
 )
-from mlpa.core.config import ERROR_CODE_INVALID_MODEL_NAME, env
-from mlpa.core.logger import logger
+from mlpa.core.config import ERROR_CODE_INVALID_MODEL_NAME, USE_OTARI, env
 from mlpa.core.metrics import record_chat_availability_for
 from mlpa.core.prometheus_metrics import AvailabilityReason
 from mlpa.core.request_timings import measure
 from mlpa.core.routers.appattest import app_attest_auth
+from mlpa.core.routers.guest.guest import (
+    is_guest_token,
+    verify_guest_token,
+)
 from mlpa.core.utils import (
     extract_user_from_play_integrity_jwt,
     get_client_country,
@@ -46,6 +49,23 @@ def _resolve_custom_virtual_key(virtual_key_header: str | None) -> str | None:
     if not key:
         return None
     return key
+
+
+def guest_virtual_key() -> str | None:
+    """
+    LiteLLM key for requests authenticated with an MLPA guest token.
+
+    Only call it after the guest token is verified, never from client headers.
+    Never falls back to MLPA_VIRTUAL_KEY, that would bill guests to FxA users.
+    Under Otari it returns None once OTARI_GUEST_SERVICE_KEY is set:
+    resolve_litellm_virtual_auth_headers picks that key by service type.
+    """
+    key = env.OTARI_GUEST_SERVICE_KEY if USE_OTARI else env.MLPA_GUEST_VIRTUAL_KEY
+    if not key:
+        raise HTTPException(
+            status_code=503, detail={"error": "Guest access is not configured."}
+        )
+    return None if USE_OTARI else key
 
 
 def _resolve_purpose(service_type_value: str, purpose_header: str | None) -> str:
@@ -80,6 +100,34 @@ def _resolve_purpose(service_type_value: str, purpose_header: str | None) -> str
     return ""
 
 
+def _authorize_guest(
+    request: Request,
+    build_authorized_request: Callable[[str, str], TAuthorizedRequest],
+    authorization: str,
+    service_type: ServiceType,
+    purpose_value: str,
+) -> TAuthorizedRequest:
+    with measure("auth_check", request):
+        guest_id = verify_guest_token(authorization)
+    guest_service_type = f"{service_type.value}-guest"
+    if guest_service_type not in env.valid_service_types_set:
+        raise HTTPException(
+            status_code=400,
+            detail=f"service-type '{service_type.value}' is not available for guests",
+        )
+    # Read by the metrics middleware, it only sees the raw header otherwise
+    request.state.service_type = guest_service_type
+    authorized = build_authorized_request(
+        f"{guest_id}:{guest_service_type}", purpose_value
+    )
+    return authorized.model_copy(
+        update={
+            "service_type": guest_service_type,
+            "litellm_virtual_key": guest_virtual_key(),
+        }
+    )
+
+
 async def _authorize_common_request(
     request: Request,
     build_authorized_request: Callable[[str, str], TAuthorizedRequest],
@@ -98,12 +146,13 @@ async def _authorize_common_request(
 
     if use_app_attest:
         # Apple App Attest
-        body_bytes = await request.body()
-        assertionAuth = parse_app_attest_jwt(authorization, "assert")
-        expected_hash = hashlib.sha256(body_bytes).digest()
-        data = await app_attest_auth(
-            assertionAuth, expected_hash, bool(use_qa_certificates)
-        )
+        with measure("auth_check", request):
+            body_bytes = await request.body()
+            assertionAuth = parse_app_attest_jwt(authorization, "assert")
+            expected_hash = hashlib.sha256(body_bytes).digest()
+            data = await app_attest_auth(
+                assertionAuth, expected_hash, bool(use_qa_certificates)
+            )
         if not data or data.get("error"):
             raise HTTPException(status_code=401, detail=data["error"])
         return build_authorized_request(
@@ -111,9 +160,18 @@ async def _authorize_common_request(
         )
     if use_play_integrity:
         # Google Play integrity
-        play_user_id = extract_user_from_play_integrity_jwt(authorization)
+        with measure("auth_check", request):
+            play_user_id = extract_user_from_play_integrity_jwt(authorization)
         return build_authorized_request(
             f"{play_user_id}:{service_type.value}", purpose_value
+        )
+    if is_guest_token(authorization):
+        return _authorize_guest(
+            request,
+            build_authorized_request,
+            authorization,
+            service_type,
+            purpose_value,
         )
     if service_type.value.endswith("-dev"):
         if x_dev_authorization is None:
@@ -121,12 +179,14 @@ async def _authorize_common_request(
                 status_code=401,
                 detail="x-dev-authorization required for dev service types (ai-dev, memories-dev, mochi-dev)",
             )
-        fxa_profile = await auth_with_key(x_dev_authorization, authorization)
+        with measure("auth_check", request):
+            fxa_profile = await auth_with_key(x_dev_authorization, authorization)
         return build_authorized_request(
             f"{fxa_profile['user']}:{service_type.value}", purpose_value
         )
 
-    fxa_user_id = await fxa_auth(authorization)
+    with measure("auth_check", request):
+        fxa_user_id = await fxa_auth(authorization)
     if not fxa_user_id or fxa_user_id.get("error"):
         raise HTTPException(status_code=401, detail=fxa_user_id["error"])
     return build_authorized_request(
@@ -146,7 +206,7 @@ async def authorize_chat_request(
     use_play_integrity: Annotated[bool | None, Header()] = None,
     litellm_virtual_key: Annotated[str | None, Header()] = None,
 ) -> AuthorizedChatRequest:
-    with measure("auth", request):
+    with measure("context_checks", request):
         client_country = get_client_country(request)
         custom_virtual_key = _resolve_custom_virtual_key(litellm_virtual_key)
 
@@ -194,48 +254,52 @@ async def authorize_chat_request(
                 detail=detail,
             )
 
-        try:
-            return await _authorize_common_request(
-                request=request,
-                build_authorized_request=lambda user,
-                purpose_value: AuthorizedChatRequest(
-                    user=user,
-                    service_type=service_type.value,
-                    purpose=purpose_value,
-                    client_country=client_country,
-                    litellm_virtual_key=custom_virtual_key,
-                    **chat_request.model_dump(exclude_unset=True),
-                ),
-                authorization=authorization,
-                service_type=service_type,
-                purpose=purpose,
-                x_dev_authorization=x_dev_authorization,
-                use_app_attest=use_app_attest,
-                use_qa_certificates=use_qa_certificates,
-                use_play_integrity=use_play_integrity,
-            )
-        except HTTPException as exc:
-            # Only record terminal HTTP failures from the shared auth call:
-            # - 401: expected or normalized auth rejection (bad creds, expired token, etc.)
-            # - 400: client error to the auth layer (invalid purpose, or malformed App
-            #        Attest base64 decoded in app_attest_auth before its try block)
-            # - anything else (e.g. App Attest's explicit 500): re-raised unrecorded;
-            #   auth-system-failure capture is left to a follow-on auth backend change
-            # Non-HTTPException errors are not caught here and propagate unrecorded.
-            if exc.status_code == 401:
-                reason = AvailabilityReason.AUTH_REJECTED
-            elif exc.status_code == 400:
-                reason = AvailabilityReason.INVALID_AUTH_REQUEST
-            else:
-                raise
-            record_chat_availability_for(
-                reason,
-                model=chat_request.model,
+    try:
+        return await _authorize_common_request(
+            request=request,
+            build_authorized_request=lambda user, purpose_value: AuthorizedChatRequest(
+                user=user,
                 service_type=service_type.value,
-                purpose=purpose or "",
+                purpose=purpose_value,
                 client_country=client_country,
+                litellm_virtual_key=custom_virtual_key,
+                **chat_request.model_dump(exclude_unset=True),
+            ),
+            authorization=authorization,
+            service_type=service_type,
+            purpose=purpose,
+            x_dev_authorization=x_dev_authorization,
+            use_app_attest=use_app_attest,
+            use_qa_certificates=use_qa_certificates,
+            use_play_integrity=use_play_integrity,
+        )
+    except HTTPException as exc:
+        # Only record terminal HTTP failures from the shared auth call:
+        # - 401: expected or normalized auth rejection (bad creds, expired token, etc.),
+        #        guest_auth_rejected when it carried an MLPA guest token
+        # - 400: client error to the auth layer (invalid purpose, or malformed App
+        #        Attest base64 decoded in app_attest_auth before its try block)
+        # - anything else (e.g. App Attest's explicit 500): re-raised unrecorded;
+        #   auth-system-failure capture is left to a follow-on auth backend change
+        # Non-HTTPException errors are not caught here and propagate unrecorded.
+        if exc.status_code == 401:
+            reason = (
+                AvailabilityReason.GUEST_AUTH_REJECTED
+                if is_guest_token(authorization)
+                else AvailabilityReason.AUTH_REJECTED
             )
+        elif exc.status_code == 400:
+            reason = AvailabilityReason.INVALID_AUTH_REQUEST
+        else:
             raise
+        record_chat_availability_for(
+            reason,
+            model=chat_request.model,
+            service_type=service_type.value,
+            purpose=purpose or "",
+            client_country=client_country,
+        )
+        raise
 
 
 async def authorize_search_request(
@@ -250,28 +314,27 @@ async def authorize_search_request(
     use_play_integrity: Annotated[bool | None, Header()] = None,
     litellm_virtual_key: Annotated[str | None, Header()] = None,
 ) -> AuthorizedSearchRequest:
-    with measure("auth", request):
+    with measure("context_checks", request):
         client_country = get_client_country(request)
         custom_virtual_key = _resolve_custom_virtual_key(litellm_virtual_key)
-        return await _authorize_common_request(
-            request=request,
-            build_authorized_request=lambda user,
-            purpose_value: AuthorizedSearchRequest(
-                user=user,
-                service_type=service_type.value,
-                purpose=purpose_value,
-                client_country=client_country,
-                litellm_virtual_key=custom_virtual_key,
-                **search_request.model_dump(exclude_unset=True),
-            ),
-            authorization=authorization,
-            service_type=service_type,
-            purpose=purpose,
-            x_dev_authorization=x_dev_authorization,
-            use_app_attest=use_app_attest,
-            use_qa_certificates=use_qa_certificates,
-            use_play_integrity=use_play_integrity,
-        )
+    return await _authorize_common_request(
+        request=request,
+        build_authorized_request=lambda user, purpose_value: AuthorizedSearchRequest(
+            user=user,
+            service_type=service_type.value,
+            purpose=purpose_value,
+            client_country=client_country,
+            litellm_virtual_key=custom_virtual_key,
+            **search_request.model_dump(exclude_unset=True),
+        ),
+        authorization=authorization,
+        service_type=service_type,
+        purpose=purpose,
+        x_dev_authorization=x_dev_authorization,
+        use_app_attest=use_app_attest,
+        use_qa_certificates=use_qa_certificates,
+        use_play_integrity=use_play_integrity,
+    )
 
 
 async def authorize_filter_request(
@@ -279,7 +342,7 @@ async def authorize_filter_request(
     filter_request: PrivacyFilterRequest,
     authorization: Annotated[str, Header()],
 ) -> AuthorizedFilterRequest:
-    with measure("auth", request):
+    with measure("context_checks", request):
         if not env.PRIVACY_FILTER_ENABLED:
             raise HTTPException(
                 status_code=503,
@@ -289,9 +352,10 @@ async def authorize_filter_request(
         if not authorization:
             raise HTTPException(status_code=401, detail="Missing authorization header")
 
+    with measure("auth_check", request):
         fxa_user_id = await fxa_auth(authorization)
-        if not fxa_user_id or fxa_user_id.get("error"):
-            raise HTTPException(status_code=401, detail=fxa_user_id["error"])
-        return AuthorizedFilterRequest(
-            user=fxa_user_id["user"], **filter_request.model_dump(exclude_unset=True)
-        )
+    if not fxa_user_id or fxa_user_id.get("error"):
+        raise HTTPException(status_code=401, detail=fxa_user_id["error"])
+    return AuthorizedFilterRequest(
+        user=fxa_user_id["user"], **filter_request.model_dump(exclude_unset=True)
+    )
