@@ -40,6 +40,8 @@ from mlpa.core.prometheus_metrics import (
 )
 from mlpa.core.utils import clamp_model
 from tests.consts import (
+    LITELLM_EXA_ANSWER_OVERLOADED_TEXT,
+    LITELLM_WRAPPED_EXA_OVERLOADED_TEXT,
     MOCK_LITELLM_GLOBAL_BUDGET_ERROR_TEXT,
     SAMPLE_REQUEST,
     SUCCESSFUL_CHAT_RESPONSE,
@@ -537,6 +539,35 @@ async def test_stream_completion_success(
         if s.labels.get("fallback_used") == "false"
     }
     assert routed_token_types == {"prompt", "completion"}
+
+
+async def test_stream_completion_reads_openai_shaped_chunks(
+    httpx_mock: HTTPXMock, mock_request, metrics_spy
+):
+    """An OpenAI-shaped stream sends "usage": null on content chunks and "choices": [] with usage."""
+    mock_chunks = [
+        b'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}], "usage": null}\n\n',
+        b'data: {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 25}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    httpx_mock.add_response(
+        method="POST",
+        url=LITELLM_COMPLETIONS_URL,
+        stream=IteratorStream(mock_chunks),
+        status_code=200,
+    )
+
+    received_chunks = [
+        chunk async for chunk in stream_completion(mock_request, SAMPLE_REQUEST)
+    ]
+
+    assert received_chunks == mock_chunks
+    chat_label_base = {
+        "model": SAMPLE_REQUEST.model,
+        "service_type": SAMPLE_REQUEST.service_type,
+        "purpose": SAMPLE_REQUEST.purpose,
+    }
+    assert metrics_spy.value("chat_tokens", type="completion", **chat_label_base) == 25
 
 
 async def test_stream_completion_litellm_routing_with_fallback(
@@ -1791,6 +1822,27 @@ def test_build_litellm_body_includes_purpose_and_country_in_spend_logs_metadata(
     assert "client_country" not in body
 
 
+def test_build_litellm_body_sends_spend_logs_metadata_to_otari_too(monkeypatch):
+    """Otari records metadata.spend_logs_metadata as request tags, so the Otari
+    backend sends it exactly as the LiteLLM one does."""
+    monkeypatch.setattr("mlpa.core.completions.USE_OTARI", True)
+    req = AuthorizedChatRequest(
+        user="test-user-123:ai",
+        service_type="ai",
+        purpose="chat",
+        client_country="FR",
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=150,
+    )
+
+    body = _build_litellm_body(req, stream=False)
+
+    assert body["metadata"] == {
+        "spend_logs_metadata": {"purpose": "chat", "country_code": "FR"}
+    }
+
+
 def test_build_litellm_body_includes_empty_purpose_and_country_when_unset():
     """Service types with no configured purposes (e.g. s2s) carry purpose="",
     and requests with no edge-stamped geo header carry client_country="" -
@@ -2001,3 +2053,130 @@ async def test_pending_task_cancel_runtime_error_suppressed(mocker, mock_request
         "a cancelled request must propagate CancelledError cleanly, not log "
         f"an ERROR for teardown noise, got: {error_records}"
     )
+
+
+EXA_ANSWER_REQUEST = SAMPLE_REQUEST.model_copy(
+    update={"model": "exa", "service_type": "answer", "purpose": ""}
+)
+_EXA_OVERLOADED_LABELS = {
+    "endpoint": "/v1/chat/completions",
+    "model": "exa",
+    "status_code": "503",
+    "tag": "SERVICE_OVERLOADED",
+}
+
+
+async def test_get_completion_exa_error_records_exa_error(mocker, metrics_spy):
+    mock_response = MagicMock()
+    mock_response.text = LITELLM_EXA_ANSWER_OVERLOADED_TEXT
+    mock_response.status_code = 503
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Service Unavailable", request=MagicMock(), response=mock_response
+    )
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    with pytest.raises(HTTPException):
+        await get_completion(
+            Request({"type": "http", "headers": []}), EXA_ANSWER_REQUEST
+        )
+
+    metrics_spy.assert_only(
+        _expect_metrics("chat_completion_latency", "chat_availability", "exa_errors")
+    )
+    assert metrics_spy.value("exa_errors", **_EXA_OVERLOADED_LABELS) == 1
+
+
+async def test_stream_completion_exa_error_records_exa_error(
+    httpx_mock: HTTPXMock, mocker, mock_request, metrics_spy
+):
+    httpx_mock.add_response(
+        method="POST",
+        url=LITELLM_COMPLETIONS_URL,
+        content=LITELLM_EXA_ANSWER_OVERLOADED_TEXT.encode(),
+        status_code=503,
+    )
+    mocker.patch.object(env, "MLPA_DEBUG", False)
+
+    received_chunks = [
+        chunk async for chunk in stream_completion(mock_request, EXA_ANSWER_REQUEST)
+    ]
+
+    assert len(received_chunks) == 1
+    metrics_spy.assert_only(
+        _expect_metrics("chat_completion_latency", "chat_availability", "exa_errors")
+    )
+    assert metrics_spy.value("exa_errors", **_EXA_OVERLOADED_LABELS) == 1
+
+
+async def test_get_completion_exa_budget_rejection_skips_exa_error(mocker, metrics_spy):
+    """LiteLLM-side budget rejections on the exa model never reached Exa."""
+    mock_response = MagicMock()
+    mock_response.text = MOCK_LITELLM_GLOBAL_BUDGET_ERROR_TEXT
+    mock_response.status_code = 400
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Bad Request", request=MagicMock(), response=mock_response
+    )
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    with pytest.raises(HTTPException):
+        await get_completion(
+            Request({"type": "http", "headers": []}), EXA_ANSWER_REQUEST
+        )
+
+    assert "exa_errors" not in metrics_spy.touched()
+
+
+async def test_get_completion_non_exa_model_skips_exa_error(mocker, metrics_spy):
+    mock_response = MagicMock()
+    mock_response.text = LITELLM_WRAPPED_EXA_OVERLOADED_TEXT
+    mock_response.status_code = 500
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "Internal Server Error", request=MagicMock(), response=mock_response
+    )
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    with pytest.raises(HTTPException):
+        await get_completion(Request({"type": "http", "headers": []}), SAMPLE_REQUEST)
+
+    assert "exa_errors" not in metrics_spy.touched()
+
+
+def test_build_litellm_body_sends_an_app_attest_user_as_it_is(monkeypatch):
+    """A standard-base64 App Attest key id often contains "/", which Otari takes
+    as it is in a request's `user`, the same id LiteLLM had."""
+    monkeypatch.setattr("mlpa.core.completions.USE_OTARI", True)
+    req = AuthorizedChatRequest(
+        user="q8Zr+0b/Yw3kT1Lx9vH2mP4nA6sD8fG0jK2lQ5wE7rU=:s2s",
+        service_type="s2s",
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+        max_completion_tokens=150,
+    )
+
+    body = _build_litellm_body(req, stream=False)
+
+    assert body["user"] == "q8Zr+0b/Yw3kT1Lx9vH2mP4nA6sD8fG0jK2lQ5wE7rU=:s2s"
+
+
+async def test_get_completion_with_null_usage(mocker, metrics_spy):
+    """A provider that reports no tokens (Liner, billed per request) reaches
+    MLPA through Otari as "usage": null; the answer is still served."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {**SUCCESSFUL_CHAT_RESPONSE, "usage": None}
+    mock_response.headers = _sample_litellm_response_headers()
+    mock_response.raise_for_status.return_value = None
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mocker.patch("mlpa.core.completions.get_http_client", return_value=mock_client)
+
+    result_data = await get_completion(
+        Request({"type": "http", "headers": []}), SAMPLE_REQUEST
+    )
+
+    assert result_data["choices"] == SUCCESSFUL_CHAT_RESPONSE["choices"]

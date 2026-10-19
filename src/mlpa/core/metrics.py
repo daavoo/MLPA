@@ -1,10 +1,11 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from mlpa.core.classes import (
     AuthorizedChatRequest,
     AuthorizedSearchRequest,
     LitellmRoutingSnapshot,
 )
+from mlpa.core.config import OTARI_HEADER_ERROR_STATUS, OTARI_HEADER_ERROR_TAG
 from mlpa.core.prometheus_metrics import (
     AvailabilityReason,
     PrometheusRejectionReason,
@@ -15,13 +16,20 @@ from mlpa.core.prometheus_metrics import (
 )
 from mlpa.core.utils import (
     clamp_country,
+    clamp_exa_error_labels,
     clamp_launch_country,
     clamp_model,
     clamp_purpose,
     clamp_service_type,
+    extract_exa_error_tag,
 )
 
 SEARCH_MODEL = "exa-search"
+EXA_ANSWER_MODEL = "exa"
+EXA_MODELS = frozenset({SEARCH_MODEL, EXA_ANSWER_MODEL})
+# Match the `endpoint` label of mlpa_requests_total.
+SEARCH_ENDPOINT = "/v1/search"
+CHAT_COMPLETIONS_ENDPOINT = "/v1/chat/completions"
 
 
 def _chat_labels(
@@ -127,6 +135,48 @@ def record_ttft(req: AuthorizedChatRequest, elapsed_seconds: float) -> None:
 
 def record_search_latency(result: PrometheusResult, elapsed_seconds: float) -> None:
     metrics.search_latency.labels(result=result).observe(elapsed_seconds)
+
+
+def record_exa_error(
+    *,
+    endpoint: str,
+    model: str,
+    status_code: int,
+    error_text: str,
+    rejected: bool,
+    headers: Mapping[str, str] | None = None,
+) -> None:
+    """Count an upstream error on an Exa-backed model.
+
+    ``rejected`` means MLPA classified the error itself (budget, rate limit,
+    ...). Those are gateway-side unless the error carries an Exa error tag.
+    Otari sends Exa's status and tag in headers; LiteLLM only in its error text.
+    """
+    if model not in EXA_MODELS:
+        return
+    raw_tag, provider_status = _otari_provider_error(headers)
+    if raw_tag is None:
+        raw_tag = extract_exa_error_tag(error_text)
+    if raw_tag is None and rejected:
+        return
+    status, tag = clamp_exa_error_labels(raw_tag, provider_status or status_code)
+    metrics.exa_errors.labels(
+        endpoint=endpoint, model=model, status_code=status, tag=tag
+    ).inc()
+
+
+def _otari_provider_error(
+    headers: Mapping[str, str] | None,
+) -> tuple[str | None, int | None]:
+    """The provider's error tag and status from Otari's headers, when it sent them."""
+    if headers is None:
+        return None, None
+    tag = headers.get(OTARI_HEADER_ERROR_TAG)
+    status = headers.get(OTARI_HEADER_ERROR_STATUS)
+    return (
+        tag if isinstance(tag, str) and tag else None,
+        int(status) if isinstance(status, str) and status.isdigit() else None,
+    )
 
 
 def extract_tool_names(items: Iterable[dict]) -> list[str]:
