@@ -16,7 +16,6 @@ from mlpa.core.auth.authorize import authorize_chat_request, authorize_search_re
 from mlpa.core.classes import AuthorizedChatRequest, AuthorizedSearchRequest
 from mlpa.core.completions import (
     get_completion,
-    get_or_create_user_for_completion,
     stream_completion,
 )
 from mlpa.core.config import (
@@ -37,8 +36,10 @@ from mlpa.core.http_client import close_http_client, get_http_client
 from mlpa.core.logger import logger, setup_logger
 from mlpa.core.metrics import (
     SEARCH_MODEL,
+    get_or_create_user_for_inference,
     record_chat_availability,
     record_request_country,
+    record_search_availability,
 )
 from mlpa.core.middleware import register_middleware
 from mlpa.core.middleware.traffic_contract_enforcer import (
@@ -47,6 +48,7 @@ from mlpa.core.middleware.traffic_contract_enforcer import (
 from mlpa.core.prometheus_metrics import AvailabilityReason
 from mlpa.core.routers.appattest import appattest_router
 from mlpa.core.routers.filter import filter_router
+from mlpa.core.routers.guest import guest_router
 from mlpa.core.routers.health import health_router
 from mlpa.core.routers.mock import mock_router
 from mlpa.core.routers.play import play_router
@@ -137,12 +139,14 @@ register_middleware(app)
 
 @app.get("/metrics", tags=["Metrics"])
 async def get_metrics():
+    await app_attest_pg.refresh_capacity_gauges()
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 app.include_router(health_router, prefix="/health")
 app.include_router(appattest_router, prefix="/verify")
 app.include_router(play_router, prefix="/verify")
+app.include_router(guest_router, prefix="/verify")
 app.include_router(user_router, prefix="/user")
 app.include_router(filter_router)
 app.include_router(mock_router, prefix="/mock")
@@ -175,11 +179,14 @@ async def chat_completion(
     await enforce_traffic_contract(request, authorized_chat_request.service_type)
     user_id = authorized_chat_request.user
     if not user_id:
+        record_chat_availability(
+            authorized_chat_request, AvailabilityReason.INVALID_AUTH_REQUEST
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "User not found from authorization response."},
         )
-    user, _ = await get_or_create_user_for_completion(
+    user, _ = await get_or_create_user_for_inference(
         request, user_id, authorized_chat_request
     )
     if user.get("blocked"):
@@ -215,6 +222,9 @@ async def search(
     if not env.valid_service_type_for_model(
         authorized_search_request.service_type, SEARCH_MODEL
     ):
+        record_search_availability(
+            authorized_search_request, AvailabilityReason.INVALID_SERVICE_TYPE_FOR_MODEL
+        )
         raise HTTPException(
             status_code=400,
             detail=f"service-type header must be one of {env.forced_model_service_type_pairs.get(SEARCH_MODEL)}",
@@ -222,14 +232,20 @@ async def search(
     await enforce_traffic_contract(request, authorized_search_request.service_type)
     user_id = authorized_search_request.user
     if not user_id:
+        record_search_availability(
+            authorized_search_request, AvailabilityReason.INVALID_AUTH_REQUEST
+        )
         raise HTTPException(
             status_code=400,
             detail={"error": "User not found from authorization response."},
         )
-    user, _ = await get_or_create_user_for_completion(
+    user, _ = await get_or_create_user_for_inference(
         request, user_id, authorized_search_request
     )
     if user.get("blocked"):
+        record_search_availability(
+            authorized_search_request, AvailabilityReason.BLOCKED
+        )
         raise HTTPException(status_code=403, detail={"error": "User is blocked."})
 
     return await get_search(request, authorized_search_request)

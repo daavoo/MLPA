@@ -1,23 +1,41 @@
 import asyncio
 import time
+from asyncio import CancelledError
 
 import httpx
 from fastapi import HTTPException, Request
+from starlette.requests import ClientDisconnect
 
 from mlpa.core.classes import AuthorizedSearchRequest
 from mlpa.core.config import (
     LITELLM_SEARCH_URL,
+    USE_OTARI,
     resolve_litellm_virtual_auth_headers,
 )
-from mlpa.core.errors import classify_upstream_error
+from mlpa.core.errors import (
+    USER_BLOCKED_DETAIL,
+    classify_upstream_error,
+    is_otari_user_blocked,
+)
 from mlpa.core.http_client import get_http_client
 from mlpa.core.logger import logger
-from mlpa.core.metrics import record_search_latency, record_search_request_rejection
-from mlpa.core.prometheus_metrics import PrometheusResult
+from mlpa.core.metrics import (
+    SEARCH_ENDPOINT,
+    SEARCH_MODEL,
+    record_exa_error,
+    record_search_availability,
+    record_search_latency,
+    record_search_request_rejection,
+)
+from mlpa.core.prometheus_metrics import AvailabilityReason, PrometheusResult
 from mlpa.core.request_timings import measure
 from mlpa.core.sanitization import sanitize_request_body, sanitize_response_body
 from mlpa.core.services.services import redis_service
 from mlpa.core.utils import raise_and_log
+
+# Exa's own filters, which Otari takes under provider_options and would
+# otherwise drop, since it ignores fields its search body doesn't name.
+EXA_FILTERS = ("includeDomains", "excludeDomains", "startPublishedDate", "category")
 
 
 async def get_search(
@@ -32,18 +50,24 @@ async def _get_search(
     request: Request, authorized_search_request: AuthorizedSearchRequest
 ):
     start_time = time.perf_counter()
-    body = sanitize_request_body(
-        authorized_search_request.model_dump(
-            exclude={
-                "client_country",
-                "service_type",
-                "purpose",
-                "litellm_virtual_key",
-            },
-            exclude_none=True,
+    with measure("request_preparation", request):
+        body = sanitize_request_body(
+            authorized_search_request.model_dump(
+                exclude={
+                    "client_country",
+                    "service_type",
+                    "purpose",
+                    "litellm_virtual_key",
+                },
+                exclude_none=True,
+            )
         )
-    )
+        if USE_OTARI:
+            filters = {key: body.pop(key) for key in EXA_FILTERS if key in body}
+            if filters:
+                body["provider_options"] = filters
     result = PrometheusResult.ERROR
+    availability_reason = AvailabilityReason.UPSTREAM_ERROR
     usage = None
     logger.debug(
         f"Starting a search request using for user {authorized_search_request.user}",
@@ -54,22 +78,35 @@ async def _get_search(
             response = await client.post(
                 f"{LITELLM_SEARCH_URL}/exa-search",
                 headers=resolve_litellm_virtual_auth_headers(
-                    authorized_search_request.litellm_virtual_key
+                    authorized_search_request.litellm_virtual_key,
+                    authorized_search_request.service_type,
                 ),
                 json=body,
             )
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as e:
+            if is_otari_user_blocked(e.response.headers):
+                raise HTTPException(status_code=403, detail=USER_BLOCKED_DETAIL)
             match = classify_upstream_error(
                 error_text=e.response.text,
                 status_code=e.response.status_code,
                 user=authorized_search_request.user,
+                headers=e.response.headers,
+            )
+            record_exa_error(
+                endpoint=SEARCH_ENDPOINT,
+                model=SEARCH_MODEL,
+                status_code=e.response.status_code,
+                error_text=e.response.text,
+                rejected=match is not None,
+                headers=e.response.headers,
             )
             if match is not None:
                 if match.log_message:
                     logger.warning(match.log_message)
                 record_search_request_rejection(authorized_search_request, match.reason)
+                availability_reason = match.availability_reason()
                 headers = (
                     {"Retry-After": match.retry_after} if match.retry_after else None
                 )
@@ -81,16 +118,34 @@ async def _get_search(
             raise_and_log(e)
 
         data = sanitize_response_body(response.json())
+        # Empty results are valid. Missing/non-list results, non-object entries,
+        # and error envelopes are not valid successful search responses.
+        if (
+            not isinstance(data, dict)
+            or "error" in data
+            or not isinstance(data.get("results"), list)
+            or any(not isinstance(item, dict) for item in data["results"])
+        ):
+            availability_reason = AvailabilityReason.INVALID_RESPONSE
+            raise HTTPException(
+                status_code=502, detail="Invalid upstream search response"
+            )
         usage = data.get("usage")
 
         result = PrometheusResult.SUCCESS
+        availability_reason = AvailabilityReason.VALID_RESPONSE
         return data
+    except (CancelledError, ClientDisconnect):
+        result = PrometheusResult.ABORT
+        availability_reason = AvailabilityReason.CLIENT_DISCONNECT
+        raise
     except HTTPException:
         raise
     except Exception as e:
         raise_and_log(e, False, 502, "Failed to proxy request")
     finally:
         record_search_latency(result, time.perf_counter() - start_time)
+        record_search_availability(authorized_search_request, availability_reason)
         asyncio.create_task(
             redis_service.update_contracts(
                 service_type=authorized_search_request.service_type,

@@ -56,7 +56,7 @@ Starts LiteLLM, PostgreSQL and Redis, migrates the app_attest database, creates 
 > .venv/bin/mlpa
 > ```
 
-Privacy Filter is disabled by default. To run it, build the [privacy-filter](https://github.com/Firefox-AI/privacy-filter) image and set `PRIVACY_FILTER_ENABLED=true` in `.env`; `start.sh` then enables the `privacy-filter` Compose profile. When disabled, `/health/readiness` skips it.
+Privacy Filter is disabled by default. To run it, build the [privacy-filter](https://github.com/Firefox-AI/privacy-filter) image and set `PRIVACY_FILTER_ENABLED=true` in `.env`; `start.sh` then enables the `privacy-filter` Compose profile. When disabled, `/health/dependencies` skips it.
 
 <details>
 <summary>Manual steps</summary>
@@ -93,6 +93,30 @@ Service account configured to hit VertexAI: `service_account.json` should be in 
 ## API Documentation
 
 After running, Swagger can be viewed at `http://localhost:<PORT>/api/docs`
+
+## Test a gateway image
+
+In GitHub Actions, select **Test gateway image → Run workflow** and supply the full
+published `litellm-gateway` image reference from Artifact Registry. Use a commit
+tag or digest to identify the candidate:
+
+```bash
+gh workflow run test-gateway-image.yml --repo Firefox-AI/MLPA \
+  -f 'image=us-docker.pkg.dev/moz-fx-llm-proxy-prod-b0b8/llm-proxy-prod/litellm-gateway:<commit-sha>'
+```
+
+The workflow pulls the image and runs `src/tests/litellm_compatibility` with
+PostgreSQL, Redis, and the local Exa stub. Normal CI uses the upstream image pinned
+in `litellm_docker_compose.yaml`; the manual workflow overrides only that image.
+Both use the same compatibility tests and configuration. The workflow does not
+deploy the candidate or enable its custom handlers in the test configuration.
+
+**Test Otari image** does the same for Otari: it runs `src/tests/otari_compatibility`
+against the image you supply instead of the one pinned in `otari_docker_compose.yaml`:
+
+```bash
+gh workflow run test-otari-image.yml --repo Firefox-AI/MLPA -f 'image=mzdotai/otari:<version>'
+```
 
 ## Auth benchmarks
 

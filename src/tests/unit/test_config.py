@@ -1,6 +1,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from mlpa.core.config import Env
 
 
@@ -183,7 +185,10 @@ def test_valid_service_types_all_service_types():
     assert "memories-dev" in service_types
     assert "mochi-dev" in service_types
     assert "search-dev" in service_types
-    assert len(service_types) == 15
+    assert "ai-guest" in service_types
+    assert "memories-guest" in service_types
+    assert "search-guest" in service_types
+    assert len(service_types) == 18
 
 
 def test_valid_service_types_set_matches_ordered_list():
@@ -381,7 +386,7 @@ def test_forced_model_service_type_pairs_defaults():
     env = Env()
 
     assert env.forced_model_service_type_pairs == {
-        "exa-search": ["search", "search-dev", "agent-search"],
+        "exa-search": ["search", "search-dev", "agent-search", "search-guest"],
         "exa": ["answer", "sw-answer"],
         "liner": ["liner-answer"],
     }
@@ -408,9 +413,24 @@ def test_valid_service_type_for_model_unconfigured_model():
     """Test that unconfigured models reject service types forced to other models."""
     env = Env()
 
-    assert env.valid_service_type_for_model("ai", "gpt-oss-120b") is True
-    assert env.valid_service_type_for_model("answer", "gpt-oss-120b") is False
-    assert env.valid_service_type_for_model("sw-answer", "gpt-oss-120b") is False
-    assert env.valid_service_type_for_model("liner-answer", "gpt-oss-120b") is False
-    assert env.valid_service_type_for_model("search", "gpt-oss-120b") is False
-    assert env.valid_service_type_for_model("search-dev", "gpt-oss-120b") is False
+    assert env.valid_service_type_for_model("ai", "mistral-small-2603") is True
+    assert env.valid_service_type_for_model("answer", "mistral-small-2603") is False
+    assert env.valid_service_type_for_model("sw-answer", "mistral-small-2603") is False
+    assert (
+        env.valid_service_type_for_model("liner-answer", "mistral-small-2603") is False
+    )
+    assert env.valid_service_type_for_model("search", "mistral-small-2603") is False
+    assert env.valid_service_type_for_model("search-dev", "mistral-small-2603") is False
+
+
+def test_guest_enabled_refuses_default_signing_secret(monkeypatch):
+    monkeypatch.setenv("MLPA_GUEST_ENABLED", "true")
+    with pytest.raises(ValueError, match="MLPA_GUEST_TOKEN_SIGNING_SECRET"):
+        Env()
+    monkeypatch.setenv("MLPA_GUEST_TOKEN_SIGNING_SECRET", "real-secret")
+    Env()
+
+
+def test_search_guest_is_valid_for_exa_search():
+    # /v1/search checks the service type after auth rewrites search -> search-guest
+    assert Env().valid_service_type_for_model("search-guest", "exa-search")

@@ -1,7 +1,7 @@
 from functools import cached_property
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -24,6 +24,42 @@ class Env(BaseSettings):
     # Example: `ai` and `memories` are coupled; `s2s`/`s2s-android` can bypass.
     MLPA_CAPPED_SERVICE_TYPES: set[str] = {"ai", "memories"}
     MLPA_ADMISSION_LOCK_TIMEOUT_MS: int = 5000
+
+    # Guest capacity gate (AIPLAT-1447): same admission as above, own counter
+    # (mlpa_user_capacity row 2). Infra deletes guest claims (capacity_id = 2)
+    # older than the token TTL and must then set row 2's current_identities to
+    # the remaining COUNT(*), otherwise slots only free up on MLPA restart.
+    # Turn MLPA_ENFORCE_GUEST_CAP on only after every pod runs this image, and
+    # off before rolling back: older images' reconcile deletes all claims,
+    # guest ones included, and never recounts row 2.
+    MLPA_MAX_GUESTS: int = 100000
+    MLPA_ENFORCE_GUEST_CAP: bool = False
+    MLPA_GUEST_SERVICE_TYPES: set[str] = {"ai-guest", "memories-guest", "search-guest"}
+    # Kill switch for GET /verify/v1/guest
+    MLPA_GUEST_ENABLED: bool = False
+
+    @model_validator(mode="after")
+    def _guest_and_user_caps_are_disjoint(self):
+        # A service type in both sets would admit one new user into both rows.
+        overlap = self.MLPA_GUEST_SERVICE_TYPES & self.MLPA_CAPPED_SERVICE_TYPES
+        if overlap:
+            raise ValueError(
+                f"MLPA_GUEST_SERVICE_TYPES and MLPA_CAPPED_SERVICE_TYPES overlap: {sorted(overlap)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _guest_secret_is_set(self):
+        # The default is in the public repo, anyone could sign guest tokens with it.
+        if (
+            self.MLPA_GUEST_ENABLED
+            and not self.MLPA_DEBUG
+            and self.MLPA_GUEST_TOKEN_SIGNING_SECRET == "mlpa-guest-dev-secret"
+        ):
+            raise ValueError(
+                "MLPA_GUEST_ENABLED needs MLPA_GUEST_TOKEN_SIGNING_SECRET set"
+            )
+        return self
 
     # Countries with their own Grafana breakout (AIPLAT-1266). Deliberately a
     # small set, distinct from the full ISO country_codes.COUNTRY_CODES list,
@@ -62,14 +98,43 @@ class Env(BaseSettings):
     # budget / rate-limit / model configuration instead configured values.
     ALLOW_CUSTOM_VIRTUAL_KEY: bool = False
 
+    # Which gateway MLPA sends inference to. "otari" replaces LiteLLM with Otari:
+    # one Otari service key for every service type, users read and managed through
+    # Otari's API rather than LiteLLM's tables.
+    GATEWAY_BACKEND: Literal["litellm", "otari"] = "litellm"
+    OTARI_API_BASE: str = "http://localhost:8000"
+    # MLPA's Otari service key: the secret Otari's config.yml declares for it
+    # (MLPA_SERVICE_KEY in scripts/otari_config.py's output). It serves requests
+    # and manages MLPA's end users; MLPA needs no other Otari credential.
+    OTARI_SERVICE_KEY: str = ""
+    # MLPA's Otari key for guests (`*-guest` service types), the counterpart of
+    # MLPA_GUEST_VIRTUAL_KEY. Declared with the same owner as OTARI_SERVICE_KEY,
+    # so the service key still manages guests, with its own ceiling as the guest
+    # spend cap and only the guest budgets to assign. Unset, guests get 503.
+    OTARI_GUEST_SERVICE_KEY: str = ""
+    # The Otari user that owns the service key and every end user, and the key's name.
+    OTARI_OWNER_USER: str = "mlpa"
+    # End users known to exist in Otari, remembered so the signup cap is checked
+    # without a lookup on every request.
+    OTARI_KNOWN_USERS_CACHE_SIZE: int = 100_000
+
     # Privacy Filter
     PRIVACY_FILTER_ENABLED: bool = False
     PRIVACY_FILTER_MASTER_KEY: str = "sk-default"
     PRIVACY_FILTER_API_BASE: str = "http://localhost:5000"
 
-    # Read-only admin dashboard (`/admin`) and GET /user/counts-by-service-type; not LiteLLM's master key
+    # Read-only admin dashboard (`/admin`) and GET /user/counts-by-service-type; not LiteLLM's master key.
+    # Under Otari its default is refused: set a real one.
     MLPA_UI_ACCESS_KEY: str = "sk-ui-access-default"
+    # MLPA's admin routes (block, unblock, budget moves, user lists). Unset, they
+    # take LiteLLM's MASTER_KEY under LiteLLM, and are closed under Otari, where
+    # MASTER_KEY no longer exists and its default would otherwise open them.
+    MLPA_ADMIN_KEY: str = ""
     MLPA_VIRTUAL_KEY: str = "sk-virtual"  # Enforces LiteLLM.max_budget
+    # Separate key for `*-guest` service types (AIPLAT-1449). Its LiteLLM
+    # max_budget is the total guest spend cap, so running it out never touches
+    # FxA users. Unset means guest requests get 503, never MLPA_VIRTUAL_KEY.
+    MLPA_GUEST_VIRTUAL_KEY: str | None = None
 
     # User Feature Budget - AI service type
     USER_FEATURE_BUDGET_AI_BUDGET_ID: str = "end-user-budget-ai"
@@ -154,6 +219,27 @@ class Env(BaseSettings):
     USER_FEATURE_BUDGET_MEMORIES_DEV_MAX_BUDGET: float = 1.0
     USER_FEATURE_BUDGET_MEMORIES_DEV_RPM_LIMIT: int = 50
     USER_FEATURE_BUDGET_MEMORIES_DEV_TPM_LIMIT: int = 5000
+
+    # User Feature Budget - guest service types (AIPLAT-1449). Clients never
+    # send these, MLPA appends "-guest" to the service-type header when the
+    # request carries an MLPA guest token.
+    USER_FEATURE_BUDGET_AI_GUEST_BUDGET_ID: str = "end-user-budget-ai-guest"
+    USER_FEATURE_BUDGET_AI_GUEST_BUDGET_DURATION: str = "1d"
+    USER_FEATURE_BUDGET_AI_GUEST_MAX_BUDGET: float = 0.05
+    USER_FEATURE_BUDGET_AI_GUEST_RPM_LIMIT: int = 20
+    USER_FEATURE_BUDGET_AI_GUEST_TPM_LIMIT: int = 2000
+
+    USER_FEATURE_BUDGET_MEMORIES_GUEST_BUDGET_ID: str = "end-user-budget-memories-guest"
+    USER_FEATURE_BUDGET_MEMORIES_GUEST_BUDGET_DURATION: str = "1d"
+    USER_FEATURE_BUDGET_MEMORIES_GUEST_MAX_BUDGET: float = 0.05
+    USER_FEATURE_BUDGET_MEMORIES_GUEST_RPM_LIMIT: int = 10
+    USER_FEATURE_BUDGET_MEMORIES_GUEST_TPM_LIMIT: int = 2000
+
+    USER_FEATURE_BUDGET_SEARCH_GUEST_BUDGET_ID: str = "end-user-budget-search-guest"
+    USER_FEATURE_BUDGET_SEARCH_GUEST_BUDGET_DURATION: str = "1d"
+    USER_FEATURE_BUDGET_SEARCH_GUEST_MAX_BUDGET: float = 0.01
+    USER_FEATURE_BUDGET_SEARCH_GUEST_RPM_LIMIT: int = 5
+    USER_FEATURE_BUDGET_SEARCH_GUEST_TPM_LIMIT: int = 2000
 
     USER_FEATURE_BUDGET_MOCHI_DEV_BUDGET_ID: str = "end-user-budget-mochi-dev"
     USER_FEATURE_BUDGET_MOCHI_DEV_BUDGET_DURATION: str = "1d"
@@ -303,6 +389,30 @@ class Env(BaseSettings):
                 "rpm_limit": self.USER_FEATURE_BUDGET_MEMORIES_DEV_RPM_LIMIT,
                 "tpm_limit": self.USER_FEATURE_BUDGET_MEMORIES_DEV_TPM_LIMIT,
             },
+            "ai-guest": {
+                "feature": self.FEATURE_SMART_WINDOW,
+                "budget_id": self.USER_FEATURE_BUDGET_AI_GUEST_BUDGET_ID,
+                "budget_duration": self.USER_FEATURE_BUDGET_AI_GUEST_BUDGET_DURATION,
+                "max_budget": self.USER_FEATURE_BUDGET_AI_GUEST_MAX_BUDGET,
+                "rpm_limit": self.USER_FEATURE_BUDGET_AI_GUEST_RPM_LIMIT,
+                "tpm_limit": self.USER_FEATURE_BUDGET_AI_GUEST_TPM_LIMIT,
+            },
+            "memories-guest": {
+                "feature": self.FEATURE_SMART_WINDOW,
+                "budget_id": self.USER_FEATURE_BUDGET_MEMORIES_GUEST_BUDGET_ID,
+                "budget_duration": self.USER_FEATURE_BUDGET_MEMORIES_GUEST_BUDGET_DURATION,
+                "max_budget": self.USER_FEATURE_BUDGET_MEMORIES_GUEST_MAX_BUDGET,
+                "rpm_limit": self.USER_FEATURE_BUDGET_MEMORIES_GUEST_RPM_LIMIT,
+                "tpm_limit": self.USER_FEATURE_BUDGET_MEMORIES_GUEST_TPM_LIMIT,
+            },
+            "search-guest": {
+                "feature": self.FEATURE_SMART_WINDOW,
+                "budget_id": self.USER_FEATURE_BUDGET_SEARCH_GUEST_BUDGET_ID,
+                "budget_duration": self.USER_FEATURE_BUDGET_SEARCH_GUEST_BUDGET_DURATION,
+                "max_budget": self.USER_FEATURE_BUDGET_SEARCH_GUEST_MAX_BUDGET,
+                "rpm_limit": self.USER_FEATURE_BUDGET_SEARCH_GUEST_RPM_LIMIT,
+                "tpm_limit": self.USER_FEATURE_BUDGET_SEARCH_GUEST_TPM_LIMIT,
+            },
             "mochi-dev": {
                 "feature": self.FEATURE_SMART_WINDOW,
                 "budget_id": self.USER_FEATURE_BUDGET_MOCHI_DEV_BUDGET_ID,
@@ -371,6 +481,11 @@ class Env(BaseSettings):
         return set(self.valid_service_types)
 
     @cached_property
+    def client_service_types(self) -> list[str]:
+        """Values a client may send in the service-type header (no `-guest`)."""
+        return [st for st in self.valid_service_types if not st.endswith("-guest")]
+
+    @cached_property
     def service_type_purposes(self) -> dict[str, list[str]]:
         """
         Valid purpose values per service type (for the purpose header and Prometheus).
@@ -390,6 +505,9 @@ class Env(BaseSettings):
             "mochi-dev": ai_purposes,
             "memories": memories_purposes,
             "memories-dev": memories_purposes,
+            "ai-guest": ai_purposes,
+            "memories-guest": memories_purposes,
+            "search-guest": [],
             "s2s": [],
             "s2s-android": [],
             "search": [],
@@ -438,7 +556,7 @@ class Env(BaseSettings):
         """
         # Force certain models to use certain service types
         return {
-            "exa-search": ["search", "search-dev", "agent-search"],
+            "exa-search": ["search", "search-dev", "agent-search", "search-guest"],
             "exa": ["answer", "sw-answer"],
             "liner": ["liner-answer"],
         }
@@ -468,7 +586,6 @@ class Env(BaseSettings):
             "exa-search",
             "gemini-2.5-flash-lite",
             "gemini-3.1-flash-lite",
-            "gpt-oss-120b",
             "liner-answers",
             "openai/gpt-4o",
             "mistral-small-2503",
@@ -511,6 +628,8 @@ class Env(BaseSettings):
     # Access token
     MLPA_ACCESS_TOKEN_SECRET: str = "mlpa-dev-secret"
     MLPA_ACCESS_TOKEN_TTL_SECONDS: int = 86400
+    MLPA_GUEST_TOKEN_TTL_SECONDS: int = 604800
+    MLPA_GUEST_TOKEN_SIGNING_SECRET: str = "mlpa-guest-dev-secret"
 
     # Dev / experimentation auth (x-dev-authorization header)
     MLPA_EXPERIMENTATION_AUTHORIZATION_TOKEN: str = "secret-dev-token"
@@ -593,10 +712,77 @@ class Env(BaseSettings):
 
 env = Env()
 
-LITELLM_READINESS_URL = f"{env.LITELLM_API_BASE}/health/readiness"
-LITELLM_INFO_URL = f"{env.LITELLM_API_BASE}/public/model_hub/info"
-LITELLM_COMPLETIONS_URL = f"{env.LITELLM_API_BASE}/v1/chat/completions"
-LITELLM_SEARCH_URL = f"{env.LITELLM_API_BASE}/v1/search"
+USER_CAPACITY_ID = 1
+GUEST_CAPACITY_ID = 2
+
+
+# env attribute names for (enforced, max identities, service types) per
+# mlpa_user_capacity row. Names, not values, so tests can patch env.
+CAPACITY_SETTINGS = {
+    USER_CAPACITY_ID: (
+        "MLPA_ENFORCE_SIGNIN_CAP",
+        "MLPA_MAX_SIGNED_IN_USERS",
+        "MLPA_CAPPED_SERVICE_TYPES",
+    ),
+    GUEST_CAPACITY_ID: (
+        "MLPA_ENFORCE_GUEST_CAP",
+        "MLPA_MAX_GUESTS",
+        "MLPA_GUEST_SERVICE_TYPES",
+    ),
+}
+
+
+def capacity_settings(capacity_id: int) -> tuple[bool, int, set[str]]:
+    """(enforced, max identities, service types) for a mlpa_user_capacity row."""
+    enforced, max_identities, service_types = (
+        getattr(env, name) for name in CAPACITY_SETTINGS[capacity_id]
+    )
+    return enforced, max_identities, service_types
+
+
+def capacity_id_for_service_type(service_type: str) -> int | None:
+    """Capacity row a new user of this service type must be admitted to, if any."""
+    for capacity_id in CAPACITY_SETTINGS:
+        enforced, _max, service_types = capacity_settings(capacity_id)
+        if enforced and service_type in service_types:
+            return capacity_id
+    return None
+
+
+USE_OTARI = env.GATEWAY_BACKEND == "otari"
+OTARI_API_ROOT = f"{env.OTARI_API_BASE.rstrip('/')}/api/v1"
+
+
+_DEFAULT_UI_ACCESS_KEY = "sk-ui-access-default"
+
+
+def admin_key() -> str | None:
+    """The key MLPA's admin routes accept, or None when they are closed."""
+    if env.MLPA_ADMIN_KEY:
+        return env.MLPA_ADMIN_KEY
+    return None if USE_OTARI else env.MASTER_KEY
+
+
+def ui_access_key() -> str | None:
+    """The key the read-only admin UI accepts, or None when it is closed."""
+    if USE_OTARI and env.MLPA_UI_ACCESS_KEY in ("", _DEFAULT_UI_ACCESS_KEY):
+        return None
+    return env.MLPA_UI_ACCESS_KEY
+
+
+# The upstream gateway's URLs. The LITELLM_ names are kept for the call sites;
+# with GATEWAY_BACKEND=otari they point at Otari's equivalents.
+if USE_OTARI:
+    LITELLM_READINESS_URL = f"{OTARI_API_ROOT}/health/readiness"
+    # Otari's readiness body carries its version, so it doubles as the info URL.
+    LITELLM_INFO_URL = LITELLM_READINESS_URL
+    LITELLM_COMPLETIONS_URL = f"{OTARI_API_ROOT}/chat/completions"
+    LITELLM_SEARCH_URL = f"{OTARI_API_ROOT}/search"
+else:
+    LITELLM_READINESS_URL = f"{env.LITELLM_API_BASE}/health/readiness"
+    LITELLM_INFO_URL = f"{env.LITELLM_API_BASE}/public/model_hub/info"
+    LITELLM_COMPLETIONS_URL = f"{env.LITELLM_API_BASE}/v1/chat/completions"
+    LITELLM_SEARCH_URL = f"{env.LITELLM_API_BASE}/v1/search"
 LITELLM_MASTER_AUTH_HEADERS = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {env.MASTER_KEY}",
@@ -608,14 +794,46 @@ LITELLM_VIRTUAL_AUTH_HEADERS = {
 }
 
 
+def is_guest_service_type(service_type: str | None) -> bool:
+    """Whether MLPA serves this service type to guests (set only after guest auth)."""
+    return (service_type or "").endswith("-guest")
+
+
+def otari_service_key(service_type: str | None) -> str:
+    """MLPA's Otari key for a service type: the guest key for guests, never the other's."""
+    if is_guest_service_type(service_type):
+        if not env.OTARI_GUEST_SERVICE_KEY:
+            raise RuntimeError(
+                "No Otari guest key; set OTARI_GUEST_SERVICE_KEY to the secret Otari's config.yml declares"
+            )
+        return env.OTARI_GUEST_SERVICE_KEY
+    if not env.OTARI_SERVICE_KEY:
+        raise RuntimeError(
+            "No Otari service key; set OTARI_SERVICE_KEY to the secret Otari's config.yml declares"
+        )
+    return env.OTARI_SERVICE_KEY
+
+
 def resolve_litellm_virtual_auth_headers(
     custom_virtual_key: str | None = None,
+    service_type: str | None = None,
 ) -> dict[str, str]:
     """
     Resolve virtual key to be forwarded to litellm, if passing custom virtual key
     the custom key will be used. Otherwise, the default LITELLM_VIRTUAL_AUTH_HEADERS
-    will be used
+    will be used. With GATEWAY_BACKEND=otari the default is MLPA's Otari service
+    key (its guest key for guests), with the budget of the request's service
+    type, which Otari puts a new end user on.
     """
+    if custom_virtual_key is None and USE_OTARI:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {otari_service_key(service_type)}",
+        }
+        config = env.service_type_config.get(service_type or "")
+        if config is not None:
+            headers[OTARI_HEADER_END_USER_BUDGET] = config["budget_id"]
+        return headers
     if custom_virtual_key is None:
         return LITELLM_VIRTUAL_AUTH_HEADERS
     return {
@@ -631,6 +849,20 @@ LITELLM_HEADER_ATTEMPTED_FALLBACKS = "x-litellm-attempted-fallbacks"
 LITELLM_HEADER_ATTEMPTED_RETRIES = "x-litellm-attempted-retries"
 LITELLM_HEADER_RESPONSE_DURATION_MS = "x-litellm-response-duration-ms"
 LITELLM_HEADER_RESPONSE_COST = "x-litellm-response-cost"
+# Otari's equivalents (Otari sends the cost in the body, as usage.cost_usd).
+OTARI_HEADER_PROVIDER = "otari-provider"
+OTARI_HEADER_ATTEMPT_COUNT = "otari-attempt-count"
+OTARI_HEADER_FALLBACK = "otari-fallback"
+OTARI_HEADER_RESPONSE_DURATION_MS = "otari-response-duration-ms"
+
+# Otari's stable refusal codes (Otari-Error-Code), and the headers beside them.
+OTARI_HEADER_ERROR_CODE = "otari-error-code"
+# Names the budget a new end user starts on, and, on a response, the one it is on.
+OTARI_HEADER_END_USER_BUDGET = "otari-end-user-budget"
+OTARI_HEADER_BUDGET_SCOPE = "otari-budget-scope"
+# A provider's own failure, on a search Otari answers 502 (Exa's status and tag).
+OTARI_HEADER_ERROR_STATUS = "otari-error-status"
+OTARI_HEADER_ERROR_TAG = "otari-error-tag"
 
 # Privacy Filter
 PRIVACY_FILTER_READINESS_URL = f"{env.PRIVACY_FILTER_API_BASE}/readyz"
@@ -652,6 +884,9 @@ ERROR_CODE_FASTLY_WAF_RATE_LIMIT: int = 6
 ERROR_CODE_INVALID_MODEL_NAME: int = 8
 ERROR_CODE_INVALID_REQUEST: int = 9
 ERROR_CODE_GLOBAL_BUDGET_LIMIT_EXCEEDED: int = 10
+# Guest virtual key (MLPA_GUEST_VIRTUAL_KEY) hit its LiteLLM max_budget (AIPLAT-1449)
+ERROR_CODE_GUEST_BUDGET_LIMIT_EXCEEDED: int = 11
+ERROR_CODE_MAX_GUESTS_REACHED: int = 12
 
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     429: {
@@ -669,7 +904,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
                             "description": (
                                 "Error code: 1 budget limit exceeded, 2 rate limit (TPM/RPM), "
                                 "5 upstream provider rate limit, 6 Fastly WAF rate limit (edge; not from MLPA), "
-                                "10 global budget limit exceeded"
+                                "10 global budget limit exceeded, 11 guest budget limit exceeded"
                             ),
                         }
                     },
@@ -690,6 +925,11 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
                         "summary": "Upstream rate limit exceeded",
                         "value": {"error": ERROR_CODE_UPSTREAM_RATE_LIMIT_EXCEEDED},
                         "description": "Upstream provider rate limit exceeded.",
+                    },
+                    "guest_budget_exceeded": {
+                        "summary": "Guest budget limit exceeded",
+                        "value": {"error": ERROR_CODE_GUEST_BUDGET_LIMIT_EXCEEDED},
+                        "description": "Shared budget for all guests is used up. Check Retry-After header (3600 seconds = 1 hour).",
                     },
                     "fastly_waf_rate_limit": {
                         "summary": "Fastly WAF rate limit",
@@ -792,7 +1032,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
         },
     },
     403: {
-        "description": "Forbidden - Maximum signed-in users reached",
+        "description": "Forbidden - Maximum signed-in users or guests reached",
         "content": {
             "application/json": {
                 "schema": {
@@ -800,7 +1040,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
                     "properties": {
                         "error": {
                             "type": "integer",
-                            "description": "Error code: 4 for maximum signed-in users reached",
+                            "description": "Error code: 4 for maximum signed-in users reached, 12 for maximum guests reached",
                         }
                     },
                     "required": ["error"],
@@ -810,7 +1050,12 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
                         "summary": "Maximum signed-in users reached",
                         "value": {"error": ERROR_CODE_MAX_USERS_REACHED},
                         "description": "New sign-ins for cap-managed service types are rejected because capacity is full.",
-                    }
+                    },
+                    "max_guests_reached": {
+                        "summary": "Maximum guests reached",
+                        "value": {"error": ERROR_CODE_MAX_GUESTS_REACHED},
+                        "description": "New guests for guest service types are rejected because guest capacity is full.",
+                    },
                 },
             }
         },

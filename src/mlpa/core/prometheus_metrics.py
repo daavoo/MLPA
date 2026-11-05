@@ -13,9 +13,11 @@ class PrometheusResult(StrEnum):
 class PrometheusRejectionReason(StrEnum):
     BUDGET_EXCEEDED = "budget_exceeded"
     GLOBAL_BUDGET_EXCEEDED = "global_budget_exceeded"
+    GUEST_BUDGET_EXCEEDED = "guest_budget_exceeded"
     RATE_LIMITED = "rate_limited"
     PAYLOAD_TOO_LARGE = "payload_too_large"
     SIGNUP_CAP_EXCEEDED = "signup_cap_exceeded"
+    GUEST_CAP_EXCEEDED = "guest_cap_exceeded"
     INVALID_MODEL_NAME = "invalid_model_name"
     INVALID_REQUEST = "invalid_request"
 
@@ -33,16 +35,13 @@ class AvailabilityReason(StrEnum):
 
     # --- pre-completion reasons (recorded in the auth dependency and route body) ---
     AUTH_REJECTED = "auth_rejected"  # excluded
+    GUEST_AUTH_REJECTED = "guest_auth_rejected"  # excluded
     INVALID_AUTH_REQUEST = "invalid_auth_request"  # excluded
     INVALID_SERVICE_TYPE_FOR_MODEL = "invalid_service_type_for_model"  # excluded
     SIGNUP_CAP_EXCEEDED = "signup_cap_exceeded"  # excluded
+    GUEST_CAP_EXCEEDED = "guest_cap_exceeded"  # excluded
     BLOCKED = "blocked"  # excluded
     PROVISIONING_FAILURE = "provisioning_failure"  # failure
-
-    # Defined but not yet emitted: auth backends normalize system failures to 401,
-    # making them indistinguishable from expected rejections. Capturing this
-    # properly requires a follow-on change to the auth backends themselves.
-    AUTH_SYSTEM_FAILURE = "auth_system_failure"  # failure
 
     # --- completion-stage reasons (recorded inside stream_completion / get_completion) ---
     # INVALID_MODEL_NAME is the exception: also recorded pre-completion, in
@@ -50,8 +49,10 @@ class AvailabilityReason(StrEnum):
     VALID_RESPONSE = "valid_response"  # success
     UPSTREAM_ERROR = "upstream_error"  # failure
     EMPTY_RESPONSE = "empty_response"  # failure
+    INVALID_RESPONSE = "invalid_response"  # failure
     BUDGET_EXCEEDED = "budget_exceeded"  # excluded
     GLOBAL_BUDGET_EXCEEDED = "global_budget_exceeded"  # failure
+    GUEST_BUDGET_EXCEEDED = "guest_budget_exceeded"  # excluded
     RATE_LIMITED_PLATFORM = "rate_limited_platform"  # excluded
     RATE_LIMITED_UPSTREAM = "rate_limited_upstream"  # excluded
     PAYLOAD_TOO_LARGE = "payload_too_large"  # excluded
@@ -62,17 +63,21 @@ class AvailabilityReason(StrEnum):
 
 _AVAILABILITY_OUTCOME_BY_REASON: dict[AvailabilityReason, AvailabilityOutcome] = {
     AvailabilityReason.AUTH_REJECTED: AvailabilityOutcome.EXCLUDED,
+    AvailabilityReason.GUEST_AUTH_REJECTED: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.INVALID_AUTH_REQUEST: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.INVALID_SERVICE_TYPE_FOR_MODEL: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.SIGNUP_CAP_EXCEEDED: AvailabilityOutcome.EXCLUDED,
+    AvailabilityReason.GUEST_CAP_EXCEEDED: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.BLOCKED: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.PROVISIONING_FAILURE: AvailabilityOutcome.FAILURE,
-    AvailabilityReason.AUTH_SYSTEM_FAILURE: AvailabilityOutcome.FAILURE,
     AvailabilityReason.VALID_RESPONSE: AvailabilityOutcome.SUCCESS,
     AvailabilityReason.UPSTREAM_ERROR: AvailabilityOutcome.FAILURE,
     AvailabilityReason.EMPTY_RESPONSE: AvailabilityOutcome.FAILURE,
+    AvailabilityReason.INVALID_RESPONSE: AvailabilityOutcome.FAILURE,
     AvailabilityReason.BUDGET_EXCEEDED: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.GLOBAL_BUDGET_EXCEEDED: AvailabilityOutcome.FAILURE,
+    # Guest spend cap or kill switch working as intended, like a personal budget.
+    AvailabilityReason.GUEST_BUDGET_EXCEEDED: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.RATE_LIMITED_PLATFORM: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.RATE_LIMITED_UPSTREAM: AvailabilityOutcome.EXCLUDED,
     AvailabilityReason.PAYLOAD_TOO_LARGE: AvailabilityOutcome.EXCLUDED,
@@ -113,6 +118,7 @@ BUCKETS_COMPLETION = (
     0.5,
     1.0,
     2.5,
+    4.0,
     5.0,
     10.0,
     20.0,
@@ -128,12 +134,13 @@ BUCKETS_SEARCH = (
     0.5,
     1.0,
     2.5,
+    4.0,
     5.0,
     10.0,
     20.0,
     float("inf"),
 )
-BUCKETS_TTFT = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, float("inf"))
+BUCKETS_TTFT = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 2.5, 5.0, 10.0, float("inf"))
 BUCKETS_TOOL_CALLS = (0, 1, 2, 3, 5, 10, 20, 50, float("inf"))
 BUCKETS_TOKENS = (
     0,
@@ -172,6 +179,14 @@ class PrometheusMetrics:
     play_verifications_total: Counter
     access_token_verifications_total: Counter
 
+    # capacity gates and guests
+    capacity_current_identities: Gauge
+    capacity_max_identities: Gauge
+    capacity_enforced: Gauge
+    guest_enabled: Gauge
+    guest_tokens_issued_total: Counter
+    users_created_total: Counter
+
     # chat completions
     chat_completion_latency: Histogram
     chat_completion_ttft: Histogram
@@ -190,6 +205,11 @@ class PrometheusMetrics:
     # search
     search_latency: Histogram
     search_request_rejections: Counter
+    search_availability: Counter
+    search_availability_by_country: Counter
+
+    # exa
+    exa_errors: Counter
 
     # litellm
     litellm_routed_completions: Counter
@@ -304,6 +324,42 @@ def build_metrics(registry: CollectorRegistry = REGISTRY) -> PrometheusMetrics:
             "Total number of Access token verifications.",
             registry=registry,
         ),
+        # Every pod mirrors the same DB counter, aggregate with max() not sum()
+        capacity_current_identities=Gauge(
+            "mlpa_capacity_current_identities",
+            "Identities holding a slot in a capacity gate (pool=user|guest), read from mlpa_user_capacity on each scrape; use max(). user = MLPA_CAPPED_SERVICE_TYPES, guest = MLPA_GUEST_SERVICE_TYPES.",
+            ["pool"],
+            registry=registry,
+        ),
+        capacity_max_identities=Gauge(
+            "mlpa_capacity_max_identities",
+            "Capacity gate ceiling (pool=user|guest), read from mlpa_user_capacity on each scrape.",
+            ["pool"],
+            registry=registry,
+        ),
+        capacity_enforced=Gauge(
+            "mlpa_capacity_enforced",
+            "1 when the capacity gate is enforced (pool=user|guest), else 0.",
+            ["pool"],
+            registry=registry,
+        ),
+        guest_enabled=Gauge(
+            "mlpa_guest_enabled",
+            "Guest kill switch (MLPA_GUEST_ENABLED): 1 when guest tokens are issued and accepted, else 0.",
+            registry=registry,
+        ),
+        users_created_total=Counter(
+            "mlpa_users_created_total",
+            "New LiteLLM end users created by MLPA, by service_type. A guest using two services counts twice.",
+            ["service_type"],
+            registry=registry,
+        ),
+        guest_tokens_issued_total=Counter(
+            "mlpa_guest_tokens_issued_total",
+            "Guest tokens issued by GET /verify/v1/guest, by flow (json|redirect).",
+            ["flow"],
+            registry=registry,
+        ),
         chat_completion_latency=Histogram(
             "mlpa_chat_completion_latency_seconds",
             "Chat completion latency in seconds.",
@@ -358,7 +414,7 @@ def build_metrics(registry: CollectorRegistry = REGISTRY) -> PrometheusMetrics:
         ),
         chat_request_rejections=Counter(
             "mlpa_chat_request_rejections_total",
-            "Number of chat requests rejected due to budget, rate limit, payload size, signup cap, invalid model name, or invalid request body.",
+            "Number of chat requests rejected due to budget, rate limit, payload size, signup or guest cap, invalid model name, or invalid request body.",
             ["reason", "model", "service_type", "purpose"],
             registry=registry,
         ),
@@ -396,6 +452,22 @@ def build_metrics(registry: CollectorRegistry = REGISTRY) -> PrometheusMetrics:
             ["outcome", "client_country", "service_type"],
             registry=registry,
         ),
+        search_availability=Counter(
+            "mlpa_search_availability_total",
+            "Final availability outcomes for POST /v1/search. Availability = "
+            "success / (success + failure); excluded and abort are ineligible.",
+            ["outcome", "reason", "model", "service_type", "purpose"],
+            registry=registry,
+        ),
+        search_availability_by_country=Counter(
+            "mlpa_search_availability_by_country_total",
+            "Interim availability outcomes for search completions, by launch-market "
+            "client country and service_type (AIPLAT-1266). outcome only (no reason "
+            "breakdown) to keep cardinality bounded; see search_availability for the "
+            "full reason breakdown without country.",
+            ["outcome", "client_country", "service_type"],
+            registry=registry,
+        ),
         search_latency=Histogram(
             "mlpa_search_latency_seconds",
             "Search latency in seconds.",
@@ -405,8 +477,14 @@ def build_metrics(registry: CollectorRegistry = REGISTRY) -> PrometheusMetrics:
         ),
         search_request_rejections=Counter(
             "mlpa_search_request_rejections_total",
-            "Number of search requests rejected due to budget, rate limit, payload size, signup cap, invalid model name, or invalid request body.",
+            "Number of search requests rejected due to budget, rate limit, payload size, signup or guest cap, invalid model name, or invalid request body.",
             ["reason", "model", "service_type", "purpose"],
+            registry=registry,
+        ),
+        exa_errors=Counter(
+            "mlpa_exa_errors_total",
+            "Errors returned by Exa for search and answer requests, by Exa status code and error tag.",
+            ["endpoint", "model", "status_code", "tag"],
             registry=registry,
         ),
         litellm_routed_completions=Counter(

@@ -8,7 +8,7 @@ import redis
 from fastapi.testclient import TestClient
 
 from mlpa import run as main_app
-from mlpa.core.config import LITELLM_MASTER_AUTH_HEADERS, env
+from mlpa.core.config import LITELLM_MASTER_AUTH_HEADERS, OTARI_API_ROOT, env
 from tests.mocks import (
     MockAppAttestPGService,
     MockFxAClientForMockRouter,
@@ -96,13 +96,13 @@ def mocked_client_integration(mocker, use_real_get_or_create_user):
 
     if not use_real_get_or_create_user:
         mocker.patch(
-            "mlpa.run.get_or_create_user_for_completion",
+            "mlpa.run.get_or_create_user_for_inference",
             lambda request, user_id, req: mock_get_or_create_user(
                 mock_litellm_pg, mock_app_attest_pg, user_id
             ),
         )
         mocker.patch(
-            "mlpa.core.routers.mock.mock.get_or_create_user_for_completion",
+            "mlpa.core.routers.mock.mock.get_or_create_user_for_inference",
             lambda request, user_id, req: mock_get_or_create_user(
                 mock_litellm_pg, mock_app_attest_pg, user_id
             ),
@@ -126,6 +126,19 @@ def proxy():
     with httpx.Client(
         base_url=env.LITELLM_API_BASE,
         headers=LITELLM_MASTER_AUTH_HEADERS,
+        timeout=PROXY_TIMEOUT_S,
+    ) as client:
+        yield client
+
+
+@pytest.fixture
+def otari():
+    """Client for Otari's end-user API, with MLPA's service key, which reads the
+    end users it bills. Only for reading back what Otari recorded -- anything MLPA
+    can do itself belongs on real_backend_client."""
+    with httpx.Client(
+        base_url=OTARI_API_ROOT,
+        headers={"Authorization": f"Bearer {env.OTARI_SERVICE_KEY}"},
         timeout=PROXY_TIMEOUT_S,
     ) as client:
         yield client
@@ -164,7 +177,8 @@ def redis_client():
 @pytest.fixture
 def real_backend_client():
     """
-    TestClient wired to the real LiteLLM proxy + Postgres, plus a bearer
+    TestClient wired to the real LiteLLM proxy (or Otari, under
+    GATEWAY_BACKEND=otari) + Postgres, plus a bearer
     token/user_id pair unique to this test. Only FxA verification is
     mocked -- budget/rate-limit enforcement is a backend concern unrelated
     to auth, and this way the test doesn't depend on a live FxA account.

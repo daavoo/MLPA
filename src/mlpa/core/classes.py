@@ -137,6 +137,10 @@ class AuthorizedChatRequest(ChatRequest, AuthorizedRequestLogMixin):
 class SearchRequest(BaseModel):
     query: str
     max_results: int = Field(ge=1, le=10)
+    includeDomains: list[str] | None = None
+    excludeDomains: list[str] | None = None
+    startPublishedDate: str | None = None
+    category: str | None = None
 
 
 class AuthorizedSearchRequest(SearchRequest, AuthorizedRequestLogMixin):
@@ -152,7 +156,7 @@ class AuthorizedFilterRequest(PrivacyFilterRequest):
 
 
 # Dynamically create ServiceType enum from config
-ServiceType = enum.Enum("ServiceType", [(st, st) for st in env.valid_service_types])
+ServiceType = enum.Enum("ServiceType", [(st, st) for st in env.client_service_types])
 
 
 @dataclass(frozen=True)
